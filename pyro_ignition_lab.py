@@ -847,6 +847,186 @@ class SpeciesThermal:
         return change
 
 
+# Model numbers are kept alongside names so tables copied from a spreadsheet stay readable.
+KINETIC_MODELS = (
+    "n 阶反应", "成核与生长", "相界反应", "平面扩散", "圆柱扩散",
+    "球形扩散", "扩散经验式", "幂律", "积分级数式", "催化反应",
+)
+ORDER_MODELS = (0, 1, 2, 7, 8, 9)
+
+
+def log_remaining(alpha, remaining):
+    return math.log1p(-alpha) if alpha < .5 else math.log(remaining)
+
+
+def nth_fraction(remaining, order, exposure):
+    """Closed isothermal loss relative to the stock present at the start of the step."""
+    if order == 1:
+        return -math.expm1(-exposure)
+    if order < 1:
+        limit = remaining ** (1 - order) / (1 - order)
+        if exposure >= limit:
+            return 1.0
+        return -math.expm1(math.log1p(-exposure / limit) / (1 - order))
+    scaled = (order - 1) * (remaining ** (order - 1)) * exposure
+    return -math.expm1(-math.log1p(scaled) / (order - 1))
+
+
+def power_increment(base, exponent, exposure):
+    """(base**exponent + exposure)**(1/exponent) - base without cancellation."""
+    if base == 0:
+        log_result = math.log(exposure) / exponent
+        return math.exp(log_result) if log_result < 709 else math.inf
+    log_ratio = math.log(exposure) - exponent * math.log(base)
+    softplus = max(0.0, log_ratio) + math.log1p(math.exp(-abs(log_ratio)))
+    growth = softplus / exponent
+    if growth < 700:
+        return base * math.expm1(growth)
+    log_result = math.log(base) + growth
+    return math.exp(log_result) - base if log_result < 709 else math.inf
+
+
+def diffusion_exposure(model, alpha, remaining, loss):
+    """Integral of 1/f across a loss expressed as a fraction of the remaining stock."""
+    log_u = log_remaining(alpha, remaining)
+    log_tail = math.log1p(-loss) if loss < 1 else -math.inf
+    if model == 4:
+        if loss < .001:
+            g = loss**2 * (.5 + loss * (1/6 + loss * (1/12 + loss/20)))
+        else:
+            g = loss + (1 - loss) * log_tail if loss < 1 else 1.0
+        return remaining * (g - loss * log_u)
+    if model == 5:
+        v = math.exp(log_u / 3)
+        z = -math.expm1(log_u / 3)
+        t = -math.expm1(log_tail / 3)
+        return v*v * t * (2*z + t * (1 - 2*z - 2*v*t/3))
+    # f = 3 / (2 alpha (1-alpha)**(1/3)). The integral stays positive at either endpoint.
+    weighted = -.5 * math.expm1(4/3 * log_tail)
+    if loss < .001:
+        g = (2/3) * loss**2 * (.5 - loss * (1/9 + loss * (1/36 + loss/81)))
+    else:
+        g = weighted + (2/7) * math.expm1(7/3 * log_tail)
+    return remaining**(4/3) * (alpha * weighted + remaining * g)
+
+
+def diffusion_fraction(model, alpha, remaining, exposure):
+    full = diffusion_exposure(model, alpha, remaining, 1.0)
+    if exposure >= full:
+        return 1.0
+    log_u = log_remaining(alpha, remaining)
+    def derivative(loss):
+        log_tail = math.log1p(-loss)
+        if model == 4:
+            return -remaining * (log_u + log_tail)
+        if model == 5:
+            return remaining * (2/3) * math.expm1(-(log_u + log_tail) / 3)
+        return (2/3) * remaining**(4/3) * (alpha + remaining * loss) * math.exp(log_tail / 3)
+    slope = derivative(0.0)
+    # Use the onset square-root scale and the local slope to bracket even tiny exposures.
+    high = min(1.0, 2 * math.sqrt(exposure / full), 2 * exposure / slope if slope else 1.0)
+    if high == 0.0:
+        return 0.0
+    low = 0.0
+    while high < 1 and diffusion_exposure(model, alpha, remaining, high) < exposure:
+        low, high = high, min(1.0, high * 2)
+    trial = (low + high) / 2
+    for _ in range(45):
+        error = diffusion_exposure(model, alpha, remaining, trial) - exposure
+        if abs(error) <= 2e-13 * exposure:
+            return trial
+        if error < 0:
+            low = trial
+        else:
+            high = trial
+        mid = (low + high) / 2
+        if mid == low or mid == high:
+            return mid
+        slope = derivative(trial)
+        candidate = trial - error / slope if slope else mid
+        trial = candidate if low < candidate < high else mid
+    return (low + high) / 2
+
+
+def kinetic_fraction(model, order, alpha, remaining, exposure):
+    """Immediate-progress integral solution, including initially singular diffusion laws."""
+    if exposure <= 0 or remaining <= 0:
+        return 0.0
+    if math.isinf(exposure):
+        return 1.0
+    if model in (0, 2, 9):
+        return nth_fraction(remaining, order, exposure)
+    if model == 1:
+        advance = power_increment(-log_remaining(alpha, remaining), order, exposure)
+        return -math.expm1(-advance)
+    if model == 3:
+        delta = exposure / (math.sqrt(alpha*alpha + exposure) + alpha)
+        return min(1.0, delta / remaining)
+    if model in (4, 5, 6):
+        return diffusion_fraction(model, alpha, remaining, exposure)
+    if model == 7:
+        return min(1.0, power_increment(alpha, order, exposure) / remaining)
+    if model == 8:
+        return nth_fraction(remaining, 1 - order, exposure / order)
+    raise ValueError("动力学模型编号须为 0–9。")
+
+
+def mixed_fractions(shapes, alpha, remaining, dt):
+    """Integrate competing shapes at frozen temperature by symmetric splitting with step doubling.
+
+    Each isolated flow is integrated in conversion space. Step size controls the error in
+    each channel's mass, including at a singular onset or at finite-time exhaustion.
+    """
+    def split(a, u, h):
+        amounts = [0.0] * len(shapes)
+        indices = range(len(shapes))
+        for sequence in (indices, reversed(indices)):
+            for i in sequence:
+                model, order, rate = shapes[i]
+                fraction = kinetic_fraction(model, order, a, u, rate * (h / 2))
+                used = u * fraction
+                amounts[i] += used
+                a += used
+                u *= 1 - fraction
+        return amounts
+
+    initial = remaining
+    amounts = [0.0] * len(shapes)
+    h = dt
+    attempts = 0
+    while dt > 0 and remaining > 0:
+        h = min(h, dt)
+        attempts += 1
+        if h <= 0 or attempts > 20000:
+            raise ValueError("竞争反应的时间尺度超出数值分辨率，请检查 Z、E、n 或缩小时间步长。")
+        trace = remaining < 1e-13 * initial
+        if not trace:
+            # A saturated split can appear converged even if the first channel took all stock.
+            predicted = max(kinetic_fraction(model, n, alpha, remaining, rate * h)
+                            for model, n, rate in shapes)
+            if predicted > .3:
+                h *= .125
+                continue
+        full = split(alpha, remaining, h)
+        left = split(alpha, remaining, h / 2)
+        middle = min(remaining, math.fsum(left))
+        right = split(alpha + middle, remaining - middle, h / 2)
+        refined = [a + b for a, b in zip(left, right)]
+        used = min(remaining, math.fsum(refined))
+        error = max(abs(a - b) for a, b in zip(full, refined))
+        tol = 2e-10 * initial + 2e-5 * used
+        if not trace and error > tol:
+            h *= max(.1, .8 * (tol / error)**(1/3))
+            continue
+        for i, amount in enumerate(refined):
+            amounts[i] += amount
+        alpha += used
+        remaining -= used
+        dt -= h
+        h *= min(4.0, .9 * (tol / error)**(1/3)) if error else 4.0
+    return [amount / initial for amount in amounts]
+
+
 @dataclass(frozen=True)
 class NetworkReaction:
     source: str
@@ -857,6 +1037,10 @@ class NetworkReaction:
     heat: float | None = None  # effective kJ/kg consumed, or separate heats below
     solid_heat: float | None = None  # J/kg condensed product formed
     gas_heat: float | None = None    # J/kg volatilized from the condensed phase
+    kinetic_model: int = 0
+    order: float = 1.0
+    catalyst_strength: float = 0.0
+    catalyst: str = ""               # condensed component whose conversion modifies model 9
 
     def absorbed_per_kg(self):
         if self.heat is not None:
@@ -914,6 +1098,18 @@ class ReactionNetwork:
             if not (math.isfinite(r.prefactor) and r.prefactor > 0 and math.isfinite(r.energy)
                     and r.energy >= 0 and 0 <= r.yield_pct <= 100):
                 raise ValueError(f"反应第 {i} 行需满足 Z > 0、E ≥ 0、凝聚相产率 0–100%，反应热须为有限数值。")
+            if type(r.kinetic_model) is not int or not 0 <= r.kinetic_model < len(KINETIC_MODELS):
+                raise ValueError(f"反应第 {i} 行动力学模型编号须为 0–9 的整数。")
+            if (not math.isfinite(r.order) or r.order < 0 or (r.kinetic_model in (1, 7, 8) and r.order == 0)
+                    or (r.kinetic_model not in ORDER_MODELS and r.order != 1)):
+                raise ValueError(f"反应第 {i} 行的 n 无效。模型 1、7、8 要求 n > 0，扩散模型的 n 留空或填 1。")
+            if not math.isfinite(r.catalyst_strength) or r.catalyst_strength < 0:
+                raise ValueError(f"反应第 {i} 行的催化系数 Kcat 须为有限非负数。")
+            if r.kinetic_model == 9:
+                if (r.catalyst or r.catalyst_strength) and r.catalyst not in seen:
+                    raise ValueError(f"反应第 {i} 行请填写组分表中已有的催化组分。")
+            elif r.catalyst or r.catalyst_strength:
+                raise ValueError(f"反应第 {i} 行的催化参数只适用于模型 9。")
             try:
                 r.absorbed_per_kg()
             except ValueError as error:
@@ -923,45 +1119,89 @@ class ReactionNetwork:
 
 
 class ReactionGrid:
-    """First-order competing channels with frozen rates during each reaction half-step."""
+    """Per-cell inventory and competitive condensed-phase reaction extents."""
     def __init__(self, network, count):
         network.validate()
         indices = {name: i for i, name in enumerate(network.names)}
         groups = {}
+        history = False
+        self.catalytic = False
         for r in network.reactions:
-            groups.setdefault(indices[r.source], []).append(
-                (indices.get(r.target), r.prefactor, r.energy * (1000 / R), r.yield_pct / 100, r.absorbed_per_kg()))
-        self.groups = tuple(groups.items())
+            source = indices[r.source]
+            model = 0 if r.kinetic_model in (2, 9) else r.kinetic_model
+            order = r.order
+            if model == 1 and order == 1:
+                model = 0
+            elif model == 7 and order == 1:
+                model, order = 0, 0
+            history |= (model, order) != (0, 1) or bool(r.catalyst_strength)
+            self.catalytic |= bool(r.catalyst_strength)
+            channels = groups.setdefault(source, {}).setdefault((model, order), [])
+            channels.append((indices.get(r.target), r.prefactor, r.energy * (1000 / R),
+                             r.yield_pct / 100, r.absorbed_per_kg(), indices.get(r.catalyst), r.catalyst_strength))
+        self.groups = [(source, sorted(shapes.items())) for source, shapes in groups.items()]
         total = math.fsum(item.initial for item in network.components)
         initial = [item.initial / total for item in network.components]
         self.mass = [initial.copy() for _ in range(count)]
-        # Track the portion of original stock separately from regenerated intermediates.
         self.virgin = [initial.copy() for _ in range(count)]
+        # Available + ever consumed = initial stock + cumulative production, even for cycles.
+        self.spent = [[0.0] * len(initial) for _ in range(count)] if history else None
 
     def advance(self, cell, temperature, dt):
         mass, virgin = self.mass[cell], self.virgin[cell]
+        spent = self.spent[cell] if self.spent is not None else None
+        conversions = ()
+        if self.catalytic:
+            conversions = tuple(d / (m + d) if m + d else 0.0 for m, d in zip(mass, spent))
         produced = [0.0] * len(mass)
         gas = heat = original_consumed = 0.0
-        for source, edges in self.groups:
-            if not mass[source]:
+        for source, groups in self.groups:
+            stock = mass[source]
+            if not stock:
                 continue
-            rates = [z * math.exp(-e / temperature) for _, z, e, _, _ in edges]
-            rate = math.fsum(rates)
-            if not rate:
+            alpha, remaining = 0.0, 1.0
+            if spent is not None:
+                supplied = stock + spent[source]
+                alpha, remaining = spent[source] / supplied, stock / supplied
+            shapes, channels = [], []
+            for (model, order), edges in groups:
+                rates = []
+                for _, z, activation, _, _, catalyst, strength in edges:
+                    rate = z * math.exp(-activation / temperature)
+                    if strength:
+                        rate *= 1 + strength * conversions[catalyst]
+                    rates.append(rate)
+                rate = math.fsum(rates)
+                if rate:
+                    shapes.append((model, order, rate))
+                    channels.append((edges, rates))
+            if not shapes:
                 continue
-            fraction = -math.expm1(-rate * dt)
-            consumed = mass[source] * fraction
+            if len(shapes) == 1:
+                model, order, rate = shapes[0]
+                fractions = [kinetic_fraction(model, order, alpha, remaining, rate * dt)]
+            else:
+                fractions = mixed_fractions(shapes, alpha, remaining, dt)
+            total_fraction = math.fsum(fractions)
+            fraction = min(1.0, total_fraction)
+            if not fraction:
+                continue
+            consumed = stock * fraction
             mass[source] -= consumed
+            if spent is not None:
+                spent[source] += consumed
             original = virgin[source] * fraction
             virgin[source] -= original
             original_consumed += original
-            for (target, _, _, retained, enthalpy), k in zip(edges, rates):
-                amount = consumed * (k / rate)
-                if target is not None:
-                    produced[target] += amount * retained
-                gas += amount * (1 - retained)
-                heat += amount * enthalpy
-        # A product enters its next reaction in the following half-step, regardless of row order.
+            for share, (_, _, rate), (edges, rates) in zip(fractions, shapes, channels):
+                path_mass = consumed * (share / total_fraction)
+                for (target, _, _, retained, enthalpy, _, _), k in zip(edges, rates):
+                    amount = path_mass * (k / rate)
+                    if target is not None:
+                        produced[target] += amount * retained
+                    gas += amount * (1 - retained)
+                    heat += amount * enthalpy
+        # Products enter the following half-step; all sources see the same catalyst snapshot.
         for i, value in enumerate(produced):
             mass[i] += value
         return gas, heat, original_consumed
@@ -1001,7 +1241,7 @@ class CellThermal:
 
 
 class SolidMixture:
-    """Bulk species properties (Gpyro v0.800, Sec. 2), on the lab's prescribed grid."""
+    """Bulk species properties on the prescribed material grid."""
     def __init__(self, model, initial_t):
         by_name = {m.name: m for m in model.materials}
         self.materials = tuple(by_name[name] for name in model.names)
@@ -1487,7 +1727,7 @@ def export_slab(path, result):
 SLAB_HELP = """一维平板 · 惰性气氛
 从受热面 z = 0 沿厚度离散。初始温度与环境温度相同。正面输入恒定的吸收热通量，两面分别与环境对流，并按各侧的表面发射率计算长波辐射换热。背面无外部热通量。其余方向按一维假设处理。
 
-「组分与反应表」可设置各凝聚相组分的初始质量分数和一阶 Arrhenius 反应。From 独立消耗，To 为凝聚相时其产率以所消耗质量的百分比表示，余量归入 gases。有效热按消耗量计（kJ/kg）。用分项热时，ΔHsol 和 ΔHvol 分别按生成的凝聚相产物、挥发物质量计（J/kg），正值吸热。
+「组分与反应表」可设置各凝聚相组分的初始质量分数。每条反应可选择动力学模型 0–9，并为适用的模型填写级数 n。点击「定位动力学列」可跳到这些输入框，「模型公式」可查看各编号对应的速率函数。局部转化率等于该组分累计消耗量除以其初始量与累计生成量之和。To 为凝聚相时其产率按消耗质量的百分比填写，余量归入 gases。有效热按消耗量计（kJ/kg）。用分项热时，ΔHsol 和 ΔHvol 分别按生成的凝聚相产物、挥发物质量计（J/kg），正值吸热。
 
 「组分热物性」可逐行设置参考密度、比热、导热和发射率，各组分使用同一个开尔文参考温度。可选温度幂指数、孔隙辐射导热和熔化吸热峰。比热按质量加权，导热和表面发射率按组分体积加权。表为空时共用平板热物性。在整体组分视图中可选组分或累计生成的 gases。
 
@@ -1508,7 +1748,8 @@ class ReactionTableEditor:
     """Edit the material model as a draft; apply all validated tables together."""
     THERMAL_LABELS = ("组分名称", "ρ₀ (kg/m³)", "c₀ (J/kg/K)", "k₀ (W/m/K)", "ε", "nρ", "nc", "nk",
                       "γ (m)", "ΔHm (J/kg)", "Tm (K)", "σm² (K²)")
-    WIDTHS = {"components": 2, "reactions": 8, "materials": len(THERMAL_LABELS)}
+    WIDTHS = {"components": 2, "reactions": 12, "materials": len(THERMAL_LABELS)}
+    MODEL_CHOICES = tuple(f"{i} · {name}" for i, name in enumerate(KINETIC_MODELS))
 
     def __init__(self, slab):
         self.slab, self.tk, self.ttk = slab, slab.tk, slab.ttk
@@ -1532,8 +1773,9 @@ class ReactionTableEditor:
              ("组分名称", "初始质量分数")),
             ("reactions", "From → To 反应",
              "To 为 gases 时凝聚相产率填 0%。有效热按每千克反应物填写。使用分项热时留空有效热，"
-             "同时填 ΔHsol（每千克凝聚相产物）和 ΔHvol（每千克挥发物）。正值吸热，负值放热。",
-             ("From", "To", "Z (1/s)", "E (kJ/mol)", "凝聚相产率 (%)", "有效热 (kJ/kg)", "ΔHsol (J/kg)", "ΔHvol (J/kg)")),
+             "同时填 ΔHsol 和 ΔHvol（正值吸热）。在右侧选每行的动力学模型和 n，模型 9 还可指定催化组分。",
+             ("From", "To", "Z (1/s)", "E (kJ/mol)", "凝聚相产率 (%)", "有效热 (kJ/kg)", "ΔHsol (J/kg)", "ΔHvol (J/kg)",
+              "动力学模型", "级数 n", "催化系数 Kcat", "催化组分")),
             ("materials", "组分热物性",
              "按组分补齐可从当前平板参数开始。填前 5 列即可用常物性，右侧可填温度指数、孔隙辐射长度和熔化峰。"
              "熔化峰宽输入方差 σm²（K²）。热物性表无数据时沿用平板公共参数。",
@@ -1561,6 +1803,9 @@ class ReactionTableEditor:
             scroll_x.grid(row=1, column=0, sticky="ew")
             canvas.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
             canvas.grid(row=0, column=0, sticky="nsew")
+            if key == "reactions":
+                ttk.Button(actions, text="定位动力学列", command=lambda c=canvas: c.xview_moveto(1)).pack(side="left")
+                ttk.Button(actions, text="模型公式", command=self.show_laws).pack(side="left", padx=6)
             grid = ttk.Frame(canvas)
             item = canvas.create_window(0, 0, anchor="nw", window=grid)
             def resize(_, c=canvas, g=grid, item=item):
@@ -1592,10 +1837,22 @@ class ReactionTableEditor:
         widgets = []
         for col in range(self.WIDTHS[key]):
             value = values[col] if col < len(values) else None
-            field = self.ttk.Entry(grid, width=11)
+            if key == "reactions" and col == 8:
+                field = self.ttk.Combobox(grid, width=17, state="readonly", values=self.MODEL_CHOICES)
+                code = str(value).strip() if value is not None else ""
+                if not code:
+                    field.current(0)
+                elif code in {str(i) for i in range(len(KINETIC_MODELS))}:
+                    field.current(int(code))
+                else:
+                    field.set(code)
+            else:
+                field = self.ttk.Entry(grid, width=11)
+                if key == "reactions" and col == 9 and value in (None, ""):
+                    value = 1
+                if value is not None:
+                    field.insert(0, str(value))
             field.grid(row=row, column=col, sticky="ew", padx=(0, 4), pady=2)
-            if value is not None:
-                field.insert(0, str(value))
             widgets.append(field)
         delete = self.ttk.Button(grid, text="删除", width=5, command=lambda: self.remove(key, widgets))
         delete.grid(row=row, column=len(widgets), padx=2)
@@ -1606,6 +1863,19 @@ class ReactionTableEditor:
         self.rows[key].remove(widgets)
         for widget in widgets:
             widget.destroy()
+
+    def show_laws(self):
+        popup = self.tk.Toplevel(self.window)
+        popup.title("动力学模型公式")
+        panel = self.ttk.Frame(popup, padding=12)
+        panel.pack(fill="both", expand=True)
+        self.ttk.Label(panel, text="α 为反应物转化率，u = 1 − α。每条反应的速率因子为 Z exp(−E/RT) f(α)。").pack(anchor="w")
+        formulas = ("uⁿ", "u [−ln u]¹⁻ⁿ / n", "uⁿ", "1 / (2α)", "1 / (−ln u)",
+                    "3 / [2 (u⁻¹ᐟ³ − 1)]", "3 / (2α u¹ᐟ³)", "α¹⁻ⁿ / n",
+                    "u¹⁻ⁿ / n", "uⁿ (1 + Kcat × 催化组分转化率)")
+        for choice, formula in zip(self.MODEL_CHOICES, formulas):
+            self.ttk.Label(panel, text=f"{choice}     {formula}").pack(anchor="w", pady=2)
+        self.ttk.Label(panel, text="模型 0、2、9 允许 n = 0，模型 1、7、8 要求 n > 0。模型 3–6 的公式与 n 无关。").pack(anchor="w", pady=(8, 0))
 
     def fill_materials(self):
         try:
@@ -1631,13 +1901,16 @@ class ReactionTableEditor:
             self.status.set("剪贴板中没有文本。")
             return
         rows = [line.split("\t") for line in lines if line.strip()]
-        lengths = {"components": (2,), "reactions": (6, 8), "materials": (5, 12)}[key]
+        lengths = {"components": (2,), "reactions": (6, 8, 10, 12), "materials": (5, 12)}[key]
         if not rows or any(len(row) not in lengths for row in rows):
             length_text = " 或 ".join(str(n) for n in lengths)
             self.status.set(f"请按表头顺序复制 {length_text} 列，使用制表符分隔。")
             return
         for widgets in self.rows[key][:]:
-            if all(not field.get().strip() for field in widgets[:-1]):
+            entries = [w.get().strip() for w in widgets[:-1]]
+            if key == "reactions" and entries[8] == self.MODEL_CHOICES[0] and entries[9] == "1":
+                entries = entries[:8] + entries[10:]
+            if not any(entries):
                 self.remove(key, widgets)
         for row in rows:
             self.add(key, [value.strip() for value in row])
@@ -1653,7 +1926,12 @@ class ReactionTableEditor:
                     numbers.append(spec.default)
                     continue
                 try:
-                    numbers.append(float(value))
+                    if spec.name == "kinetic_model":
+                        numbers.append(int(value.split(" · ")[0]))
+                    elif spec.name == "catalyst":
+                        numbers.append(value)
+                    else:
+                        numbers.append(float(value))
                 except ValueError as error:
                     name = {"components": "组分", "reactions": "反应", "materials": "热物性"}[key]
                     raise ValueError(f"{name}第 {index} 行存在空白或无效数字。") from error
@@ -1870,6 +2148,12 @@ def inverse_fields(kinetics):
             prefix = f"反应 {i + 1} · {reaction.source} → {reaction.target}"
             fields.extend(((f"{i}.energy", prefix + " · E (kJ/mol)", 0, max(500, reaction.energy * 2)),
                            (f"{i}.log_z", prefix + " · log₁₀Z", -300, 300)))
+            if reaction.kinetic_model in ORDER_MODELS:
+                lower = min(1e-6, reaction.order / 2) if reaction.kinetic_model in (1, 7, 8) else 0.0
+                fields.append((f"{i}.order", prefix + " · 级数 n", lower, max(8.0, 2 * reaction.order)))
+            if reaction.kinetic_model == 9 and reaction.catalyst:
+                fields.append((f"{i}.catalyst_strength", prefix + " · Kcat", 0.0,
+                               max(100.0, 2 * reaction.catalyst_strength)))
             if reaction.heat is None:
                 for key, symbol, active in (("solid_heat", "ΔHsol", reaction.yield_pct > 0),
                                              ("gas_heat", "ΔHvol", reaction.yield_pct < 100)):
@@ -2952,7 +3236,7 @@ SLAB_VIEWS = {
 }
 PROFILES = {"profile", "residual_profile"}
 CASE_FORMAT = "pyro-ignition-lab/slab"
-CASE_VERSION = 2
+CASE_VERSION = 3
 
 
 def slab_probe(result, depth):
@@ -3011,10 +3295,15 @@ def save_slab_case(path, case):
         network = asdict(case.kinetics)
         if (case.kinetics.materials or case.kinetics.reference_temperature != 298.15
                 or any(r.heat is None for r in case.kinetics.reactions)):
-            version = CASE_VERSION
+            version = 2
         else:
             del network["materials"], network["reference_temperature"]
         for row in network["reactions"]:
+            for key, default in (("kinetic_model", 0), ("order", 1.0), ("catalyst_strength", 0.0), ("catalyst", "")):
+                if row[key] == default:
+                    del row[key]
+                else:
+                    version = CASE_VERSION
             for key in ("heat", "solid_heat", "gas_heat"):
                 if row[key] is None:
                     del row[key]
@@ -3121,7 +3410,7 @@ def load_slab_case(path):
     except (UnicodeError, ValueError, RecursionError) as error:
         raise ValueError("无法读取算例 JSON。") from error
     if (not isinstance(data, dict) or data.get("format") != CASE_FORMAT
-            or type(data.get("version")) is not int or data.get("version") not in (1, CASE_VERSION)):
+            or type(data.get("version")) is not int or data.get("version") not in (1, 2, CASE_VERSION)):
         raise ValueError("算例格式或版本不受支持。")
     parameters = SlabParameters(**checked_case_fields(data.get("parameters"), (v[0] for v in SLAB_FIELDS)))
     validate_slab(parameters)
@@ -3144,14 +3433,18 @@ def load_slab_case(path):
             for row in rows:
                 if not isinstance(row, dict) or not required <= row.keys() <= allowed:
                     raise ValueError("组分或反应行的字段不完整。")
-                if any(not isinstance(row[k], str) for k in strings):
+                if any(not isinstance(row[k], str) for k in strings if k in row):
                     raise ValueError("组分名称必须是文本。")
                 numeric = {k: checked_case_number(v) for k, v in row.items() if k not in strings
                            and not (v is None and cls is NetworkReaction and k in ("heat", "solid_heat", "gas_heat"))}
-                items.append(cls(**{k: row[k] for k in strings}, **numeric))
+                if "kinetic_model" in numeric:
+                    if not numeric["kinetic_model"].is_integer():
+                        raise ValueError("动力学模型编号须为整数。")
+                    numeric["kinetic_model"] = int(numeric["kinetic_model"])
+                items.append(cls(**{k: row[k] for k in strings if k in row}, **numeric))
             return tuple(items)
         kinetics = ReactionNetwork(records("components", Component, ("name",)),
-                                   records("reactions", NetworkReaction, ("source", "target")),
+                                   records("reactions", NetworkReaction, ("source", "target", "catalyst")),
                                    records("materials", SpeciesThermal, ("name",)) if "materials" in source else (),
                                    checked_case_number(source.get("reference_temperature", 298.15)))
         kinetics.validate()

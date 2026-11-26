@@ -1,0 +1,58 @@
+{
+  "format": "pyro-ignition-lab/slab",
+  "version": 3,
+  "parameters": {
+    "thickness": 8.0,
+    "density": 550.0,
+    "conductivity": 0.19,
+    "heat_capacity": 1550.0,
+    "flux": 0,
+    "front_h": 10.0,
+    "back_h": 18.0,
+    "emissivity": 0.85,
+    "ambient": 25.0,
+    "duration": 10,
+    "cells": 8,
+    "step": 0.25
+  },
+  "kinetics": {
+    "type": "network",
+    "data": {
+      "components": [
+        {
+          "name": "一级组分",
+          "initial": 0.5
+        },
+        {
+          "name": "二级组分",
+          "initial": 0.5
+        }
+      ],
+      "reactions": [
+        {
+          "source": "一级组分",
+          "target": "gases",
+          "prefactor": 0.1,
+          "energy": 0,
+          "yield_pct": 0,
+          "heat": 0
+        },
+        {
+          "source": "二级组分",
+          "target": "gases",
+          "prefactor": 0.1,
+          "energy": 0,
+          "yield_pct": 0,
+          "heat": 0,
+          "order": 2
+        }
+      ]
+    }
+  },
+  "result": null,
+  "view": {
+    "probe_depth_mm": 0,
+    "plot": "composition",
+    "time_index": 0
+  }
+}
