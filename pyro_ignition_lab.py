@@ -1390,6 +1390,173 @@ def fit_experiments(cases, kinetics, specs, weights, method, budget, seed, cance
     return InverseResult(fit, validation_score, tuple(case_results))
 
 
+def write_experiment_template(path):
+    with open(path, "w", newline="", encoding="utf-8-sig") as file:
+        csv.writer(file).writerow(["time_s", *(key for key, *_ in OBSERVABLES)])
+
+
+@dataclass(frozen=True)
+class ComparisonPoint:
+    time: float
+    observed: float | None
+    predicted: float
+
+    @property
+    def residual(self):
+        return None if self.observed is None else self.predicted - self.observed
+
+
+def comparison_points(case, predictions, metric):
+    return tuple(ComparisonPoint(row.time, row.values[metric], fitted[metric])
+                 for row, fitted in zip(case.observations, predictions, strict=True))
+
+
+def comparison_statistics(points):
+    residuals = [p.residual for p in points if p.observed is not None]
+    if not residuals:
+        return 0, None, None, None
+    n = len(residuals)
+    return (n, math.sqrt(math.fsum(r * r for r in residuals) / n),
+            math.fsum(abs(r) for r in residuals) / n, math.fsum(residuals) / n)
+
+
+def export_comparison(path, metric, points):
+    key = OBSERVABLES[metric][0]
+    with open(path, "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.writer(file)
+        writer.writerow(["time_s", "observed_" + key, "predicted_" + key, "residual_" + key])
+        writer.writerows((p.time, p.observed, p.predicted, p.residual) for p in points)
+
+
+class ComparisonWindow:
+    """A snapshot of a single case and model, aligned to the experimental times."""
+
+    def __init__(self, inverse, case, predictions, method):
+        self.lab, self.case, self.predictions = inverse.lab, case, predictions
+        tk, ttk = inverse.tk, inverse.ttk
+        self.window = tk.Toplevel(inverse.window)
+        self.window.title(f"实验对比 · {case.name} · {method}")
+        self.window.geometry("860x520")
+        self.window.minsize(600, 380)
+        panel = ttk.Frame(self.window, padding=12)
+        panel.pack(fill="both", expand=True)
+        role = "留出验证" if case.validation else "训练工况"
+        self.lab.text(panel, f"{case.name} · {role} · {method}", bg=BG, size=13, bold=True,
+                      wraplength=660).pack(anchor="w", pady=(0, 8))
+        bar = ttk.Frame(panel)
+        bar.pack(fill="x")
+        self.metrics = [i for i in range(len(OBSERVABLES))
+                        if any(obs.values[i] is not None for obs in case.observations)]
+        self.choice = ttk.Combobox(bar, values=[OBSERVABLES[i][1] for i in self.metrics],
+                                   state="readonly", width=24)
+        self.choice.current(0)
+        self.choice.pack(side="left")
+        self.choice.bind("<<ComboboxSelected>>", self.select)
+        self.mode = tk.StringVar(value="overlay")
+        for label, mode in (("实测与预测", "overlay"), ("残差", "residual")):
+            ttk.Radiobutton(bar, text=label, value=mode, variable=self.mode,
+                            command=self.draw).pack(side="left", padx=(6, 0))
+        ttk.Button(bar, text="导出当前指标 CSV", command=self.save).pack(side="right")
+        self.summary, self.readout = tk.StringVar(), tk.StringVar()
+        self.lab.text(panel, value=self.summary, bg=BG, size=10, fg=ACCENT).pack(anchor="w", pady=(8, 4))
+        self.canvas = tk.Canvas(panel, bg=PANEL, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.lab.text(panel, value=self.readout, bg=BG, size=9, fg=MUTED).pack(anchor="w", pady=(6, 0))
+        self.times = tuple(row.time for row in case.observations)
+        self.canvas.bind("<Configure>", self.draw)
+        self.canvas.bind("<Motion>", self.inspect)
+        self.canvas.bind("<Leave>", self.clear_cursor)
+        self.select()
+
+    def select(self, _event=None):
+        self.metric = self.metrics[self.choice.current()]
+        self.points = comparison_points(self.case, self.predictions, self.metric)
+        n, rmse, mae, bias = comparison_statistics(self.points)
+        self.summary.set(f"有效观测 {n} 个    RMSE {rmse:.4g}    平均绝对误差 {mae:.4g}    平均偏差 {bias:+.4g}")
+        self.draw()
+
+    def clear_cursor(self, _event=None):
+        self.canvas.delete("cursor")
+        self.readout.set("移动鼠标可读取实验时刻的数值。残差 = 预测 − 实测。")
+
+    def draw(self, _event=None):
+        c = self.canvas
+        c.delete("all")
+        self.clear_cursor()
+        left, right, top, bottom = 78, c.winfo_width() - 28, 37, c.winfo_height() - 47
+        self.box = None
+        if right <= left or bottom <= top:
+            return
+        self.box = (left, right, top, bottom)
+        residual = self.mode.get() == "residual"
+        measured = [p for p in self.points if p.observed is not None]
+        if residual:
+            limit = max(abs(p.residual) for p in measured) or 1.0
+            low, high = -1.05 * limit, 1.05 * limit
+        else:
+            values = [p.predicted for p in self.points] + [p.observed for p in measured]
+            low, high = min(values), max(values)
+            pad = (high - low) * .06 or max(abs(low) * .01, 1e-3)
+            low, high = low - pad, high + pad
+        start, end = self.times[0], self.times[-1]
+
+        def px(t):
+            return left + (t - start) / (end - start) * (right - left)
+
+        def py(v):
+            return bottom - (v - low) / (high - low) * (bottom - top)
+
+        c.create_text(9, 14, text=OBSERVABLES[self.metric][1], fill=INK, anchor="w")
+        legend = "点 = 预测 − 实测" if residual else "点 = 实测    线 = 预测"
+        c.create_text(right, 14, text=legend, fill=MUTED, anchor="e")
+        for tick in range(5):
+            f = tick / 4
+            x, y = left + f * (right - left), bottom - f * (bottom - top)
+            c.create_line(left, y, right, y, fill=LINE)
+            c.create_text(left - 6, y, text=f"{low + f * (high - low):.4g}", anchor="e", fill=MUTED)
+            c.create_text(x, bottom + 12, text=f"{start + f * (end - start):.4g}", fill=MUTED)
+        c.create_text((left + right) / 2, bottom + 32, text="时间 (s)", fill=MUTED)
+        if residual:
+            c.create_line(left, py(0), right, py(0), fill=FURNACE, dash=(5, 3))
+        else:
+            coords = [v for p in self.points for v in (px(p.time), py(p.predicted))]
+            c.create_line(*coords, fill=ACCENT, width=2)
+        for p in measured:
+            x, y = px(p.time), py(p.residual if residual else p.observed)
+            c.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, fill=AIR, outline="")
+
+    def inspect(self, event):
+        if not self.box:
+            return
+        left, right, top, bottom = self.box
+        if not (left <= event.x <= right and top <= event.y <= bottom):
+            self.clear_cursor()
+            return
+        start, end = self.times[0], self.times[-1]
+        t = start + (event.x - left) / (right - left) * (end - start)
+        j = min(bisect.bisect_left(self.times, t), len(self.times) - 1)
+        if j and abs(self.times[j-1] - t) <= abs(self.times[j] - t):
+            j -= 1
+        p = self.points[j]
+        x = left + (p.time - start) / (end - start) * (right - left)
+        self.canvas.delete("cursor")
+        self.canvas.create_line(x, top, x, bottom, fill=MUTED, dash=(2, 3), tags="cursor")
+        measured = "缺测" if p.observed is None else f"{p.observed:.5g}"
+        delta = "—" if p.residual is None else f"{p.residual:+.5g}"
+        self.readout.set(f"{p.time:g} s    实测 {measured}    预测 {p.predicted:.5g}    残差 {delta}")
+
+    def save(self):
+        path = self.lab.dialog.asksaveasfilename(parent=self.window, defaultextension=".csv",
+            initialfile=f"comparison_{OBSERVABLES[self.metric][0]}.csv", filetypes=[("CSV", "*.csv")])
+        if path:
+            try:
+                export_comparison(path, self.metric, self.points)
+            except OSError as error:
+                self.readout.set(f"导出失败 · {error}")
+            else:
+                self.readout.set(f"已导出当前指标 · {Path(path).name}")
+
+
 class InverseWindow:
     def __init__(self, slab, parameters, kinetics):
         self.slab, self.lab = slab, slab.lab
@@ -1423,7 +1590,7 @@ class InverseWindow:
         self.draw_settings()
         self.draw_results()
         self.controls()
-        self.window.after(100, self.poll)
+        self.timer = self.window.after(100, self.poll)
 
     def tab(self, name):
         child = self.ttk.Frame(self.tabs, padding=10)
@@ -1457,6 +1624,14 @@ class InverseWindow:
                                    ("实验", "用途", "厚度 (mm)", "热通量 (kW/m²)", "观测时刻数"), 12)
         self.case_list.column("name", width=230)
         self.case_list.pack(fill="both", expand=True)
+        self.case_list.bind("<<TreeviewSelect>>", lambda _: self.controls())
+        actions = ttk.Frame(self.case_tab)
+        actions.pack(fill="x", pady=(6, 0))
+        self.preview_button = ttk.Button(actions, text="用当前材料对比", command=self.preview_case)
+        self.preview_button.pack(side="left", padx=(0, 6))
+        self.preview_stop = ttk.Button(actions, text="停止计算", command=self.stop.set)
+        self.preview_stop.pack(side="left")
+        ttk.Button(actions, text="导出实验 CSV 模板", command=self.save_template).pack(side="right")
 
     def draw_settings(self):
         tk, ttk = self.tk, self.ttk
@@ -1521,9 +1696,14 @@ class InverseWindow:
         self.apply_button.pack(side="left", padx=(0, 6))
         self.export_button = ttk.Button(bar, text="导出训练和验证对比 CSV", command=self.save)
         self.export_button.pack(side="left")
+        self.compare_button = ttk.Button(bar, text="查看工况曲线与残差", command=self.compare_fit)
+        self.compare_button.pack(side="left", padx=(6, 0))
+        self.metrics.bind("<<TreeviewSelect>>", lambda _: self.controls())
+        self.metrics.bind("<Double-1>", self.compare_row)
 
     def close(self):
         self.stop.set()
+        self.window.after_cancel(self.timer)
         self.window.destroy()
 
     def controls(self):
@@ -1532,6 +1712,12 @@ class InverseWindow:
         self.start_button.configure(state="disabled" if self.busy else "normal")
         self.stop_button.configure(state="normal" if self.busy else "disabled")
         state = "normal" if self.results and not self.busy else "disabled"
+        self.preview_button.configure(state="normal" if self.case_list.selection() and not self.busy else "disabled")
+        self.preview_stop.configure(state="normal" if self.busy else "disabled")
+        selection = self.metrics.selection()
+        report = self.selected()
+        valid = report and selection and report.case_results[int(selection[0])][1] is not None
+        self.compare_button.configure(state="normal" if valid and not self.busy else "disabled")
         self.apply_button.configure(state=state)
         self.export_button.configure(state=state)
 
@@ -1561,6 +1747,49 @@ class InverseWindow:
                 self.cases_changed()
                 self.case_list.selection_set(str(len(self.cases) - 1))
                 self.status.set("已添加训练工况。可选中它切换为验证工况。")
+
+    def save_template(self):
+        path = self.lab.dialog.asksaveasfilename(parent=self.window, defaultextension=".csv",
+            initialfile="slab_experiment.csv", filetypes=[("CSV", "*.csv")])
+        if path:
+            try:
+                write_experiment_template(path)
+            except OSError as error:
+                self.status.set(f"模板保存失败 · {error}")
+            else:
+                self.status.set("模板已导出。填入至少两个递增时刻和对应实测值，缺测留空。")
+
+    def preview_case(self):
+        selection = self.case_list.selection()
+        if self.busy or not selection:
+            return
+        case = self.cases[int(selection[0])]
+        try:
+            p, kinetics = self.slab.parameter_snapshot(), self.slab.current_kinetics()
+        except ValueError as error:
+            self.status.set(f"平板参数有误 · {error}")
+            return
+        # Reuse the imported experiment's boundary conditions, time span and mesh.
+        material = replace(case.parameters, density=p.density, conductivity=p.conductivity,
+                           heat_capacity=p.heat_capacity)
+        case = replace(case, parameters=material)
+        self.busy = True
+        self.stop.clear()
+        self.controls()
+        self.status.set(f"正在按当前材料参数计算 · {case.name}")
+
+        def worker():
+            try:
+                _, predictions = evaluate_case(case, kinetics, (), (), self.stop.is_set)
+                if self.stop.is_set():
+                    raise FitCancelled()
+            except FitCancelled:
+                self.queue.put(("error", "已停止实验对比。"))
+            except (ValueError, ArithmeticError) as error:
+                self.queue.put(("error", f"实验对比失败 · {error}"))
+            else:
+                self.queue.put(("preview", (case, predictions)))
+        threading.Thread(target=worker, daemon=True).start()
 
     def toggle(self):
         if selection := self.case_list.selection():
@@ -1649,6 +1878,14 @@ class InverseWindow:
                 event, data = self.queue.get_nowait()
                 if event == "done":
                     self.finish(data)
+                elif event == "preview":
+                    self.busy = False
+                    self.controls()
+                    if self.stop.is_set():
+                        self.status.set("已停止实验对比。")
+                    else:
+                        ComparisonWindow(self, *data, "当前材料")
+                        self.status.set("对比完成。热物性和反应采用当前平板设置，边界与网格取自所选工况。")
                 else:
                     self.status.set(data)
                     if event == "error":
@@ -1656,7 +1893,7 @@ class InverseWindow:
                         self.controls()
         except queue.Empty:
             pass
-        self.window.after(100, self.poll)
+        self.timer = self.window.after(100, self.poll)
 
     @staticmethod
     def fmt(value):
@@ -1681,18 +1918,38 @@ class InverseWindow:
         report = self.selected()
         if report is None:
             return
+        selection = self.metrics.selection()
         self.metrics.delete(*self.metrics.get_children())
         failed = []
-        for case, (errors, _, failure) in zip(self.cases, report.case_results):
+        for index, (case, (errors, _, failure)) in enumerate(zip(self.cases, report.case_results)):
             role = "验证" if case.validation else "训练"
             if failure:
                 failed.append(f"{case.name}：{failure}")
-            self.metrics.insert("", "end", values=(case.name, role,
+            self.metrics.insert("", "end", iid=str(index), values=(case.name, role,
                 *(self.fmt(value) for value in errors)) if errors else (case.name, role, "计算失败", "", "", ""))
+        self.metrics.selection_set(selection[0] if selection else "0")
+        self.controls()
         descriptions = {key: label for key, label, *_ in inverse_fields(self.kinetics)}
         self.parameters_readout.set("    ".join(f"{descriptions[key]}  {value:.6g}"
                                     for (key, _, _), value in zip(self.specs, report.fit.values)))
         self.status.set("反演与留出验证已完成。" if not failed else "验证未完成 · " + "；".join(failed))
+
+    def compare_row(self, event):
+        row = self.metrics.identify_row(event.y)
+        if row:
+            self.metrics.selection_set(row)
+            self.compare_fit()
+
+    def compare_fit(self):
+        report, selection = self.selected(), self.metrics.selection()
+        if self.busy or not report or not selection:
+            return
+        index = int(selection[0])
+        _, predictions, failure = report.case_results[index]
+        if predictions is None:
+            self.status.set(f"此工况缺少预测 · {failure}")
+            return
+        ComparisonWindow(self, self.cases[index], predictions, report.fit.method)
 
     def apply(self):
         report = self.selected()
