@@ -752,7 +752,7 @@ class SlabFrame:
     residual: tuple[float, ...]
     remaining_mass: float   # % of initial sample mass
     loss_rate: float       # g/(m² s), step average
-    composition: tuple[float, ...] = ()  # original, intermediate, char, released (% initial)
+    composition: tuple[float, ...] = ()  # condensed components followed by generated gas (% initial)
 
 
 @dataclass(frozen=True)
@@ -762,6 +762,7 @@ class SlabResult:
     peak_loss: float
     mass_error: float
     energy_error: float
+    component_names: tuple[str, ...] = ()  # named condensed species; gas is the final composition column
 
 
 @dataclass(frozen=True)
@@ -788,6 +789,103 @@ class SlabMechanism:
     char: SolidProperties = SolidProperties(280, 1100, .10)
 
 
+@dataclass(frozen=True)
+class Component:
+    name: str
+    initial: float  # fraction of initial bulk sample mass
+
+
+@dataclass(frozen=True)
+class NetworkReaction:
+    source: str
+    target: str     # a condensed component or "gases"
+    prefactor: float  # Z in 1/s
+    energy: float     # kJ/mol
+    yield_pct: float  # condensed product per consumed mass
+    heat: float       # effective kJ/kg of reactant consumed, endothermic positive
+
+
+@dataclass(frozen=True)
+class ReactionNetwork:
+    components: tuple[Component, ...]
+    reactions: tuple[NetworkReaction, ...]
+
+    @property
+    def names(self):
+        return tuple(item.name for item in self.components)
+
+    def validate(self):
+        if not self.components or not self.reactions:
+            raise ValueError("至少需要一个凝聚相组分和一条反应。")
+        seen = set()
+        for row, item in enumerate(self.components, 1):
+            name = item.name
+            if (not isinstance(name, str) or not name or name != name.strip() or not name.isprintable()
+                    or name.casefold() == "gases" or name in seen):
+                raise ValueError(f"组分第 {row} 行名称为空、重复、含无效字符或使用了保留名 gases。")
+            seen.add(name)
+            if not 0 <= item.initial <= 1:
+                raise ValueError(f"组分第 {row} 行初始质量分数须为 0–1。")
+        total = math.fsum(item.initial for item in self.components)
+        if abs(total - 1) > 1e-9:
+            raise ValueError(f"初始质量分数之和为 {total:.10g}，应为 1。")
+        for i, r in enumerate(self.reactions, 1):
+            if r.source not in seen or (r.target != "gases" and r.target not in seen):
+                raise ValueError(f"反应第 {i} 行 From 或 To 名称未在组分表定义。")
+            if r.source == r.target:
+                raise ValueError(f"反应第 {i} 行的 From 与 To 相同。")
+            if not (math.isfinite(r.prefactor) and r.prefactor > 0 and math.isfinite(r.energy)
+                    and r.energy >= 0 and math.isfinite(r.heat) and 0 <= r.yield_pct <= 100):
+                raise ValueError(f"反应第 {i} 行需满足 Z > 0、E ≥ 0、凝聚相产率 0–100%，反应热须为有限数值。")
+            if r.target == "gases" and r.yield_pct != 0:
+                raise ValueError(f"反应第 {i} 行产物为 gases，凝聚相产率应为 0%。")
+
+
+class ReactionGrid:
+    """First-order competing channels with frozen rates during each reaction half-step."""
+    def __init__(self, network, count):
+        network.validate()
+        indices = {name: i for i, name in enumerate(network.names)}
+        groups = {}
+        for r in network.reactions:
+            groups.setdefault(indices[r.source], []).append(
+                (indices.get(r.target), r.prefactor, r.energy * (1000 / R), r.yield_pct / 100, r.heat * 1000))
+        self.groups = tuple(groups.items())
+        total = math.fsum(item.initial for item in network.components)
+        initial = [item.initial / total for item in network.components]
+        self.mass = [initial.copy() for _ in range(count)]
+        # Track the portion of original stock separately from regenerated intermediates.
+        self.virgin = [initial.copy() for _ in range(count)]
+
+    def advance(self, cell, temperature, dt):
+        mass, virgin = self.mass[cell], self.virgin[cell]
+        produced = [0.0] * len(mass)
+        gas = heat = original_consumed = 0.0
+        for source, edges in self.groups:
+            if not mass[source]:
+                continue
+            rates = [z * math.exp(-e / temperature) for _, z, e, _, _ in edges]
+            rate = math.fsum(rates)
+            if not rate:
+                continue
+            fraction = -math.expm1(-rate * dt)
+            consumed = mass[source] * fraction
+            mass[source] -= consumed
+            original = virgin[source] * fraction
+            virgin[source] -= original
+            original_consumed += original
+            for (target, _, _, retained, enthalpy), k in zip(edges, rates):
+                amount = consumed * (k / rate)
+                if target is not None:
+                    produced[target] += amount * retained
+                gas += amount * (1 - retained)
+                heat += amount * enthalpy
+        # A product enters its next reaction in the following half-step, regardless of row order.
+        for i, value in enumerate(produced):
+            mass[i] += value
+        return gas, heat, original_consumed
+
+
 REACTION_FIELDS = (
     ("energy", "活化能 (kJ/mol)", 30, 300),
     ("log_a", "log₁₀(A / s⁻¹)", 2, 14),
@@ -802,6 +900,9 @@ PROPERTY_FIELDS = (
 
 
 def validate_mechanism(mechanism):
+    if isinstance(mechanism, ReactionNetwork):
+        mechanism.validate()
+        return
     if mechanism.mode not in ("parallel", "series"):
         raise ValueError("请选择并联或串联反应。")
     materials = ((mechanism.char, "残炭"),)
@@ -988,13 +1089,15 @@ def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=Tru
     front = back = ambient
     peak_loss = vented = sum_reaction_heat = sum_boundary_heat = 0.0
     max_mass_error = max_energy_error = 0.0
-    energy, log_prefactor, yield_percent = kinetics if kinetics is not None else (0.0, 0.0, 0.0)
-    if kinetics is not None:
+    network = ReactionGrid(kinetics, count) if isinstance(kinetics, ReactionNetwork) else None
+    single = kinetics is not None and network is None
+    energy, log_prefactor, yield_percent = kinetics if single else (0.0, 0.0, 0.0)
+    if single:
         for key, value in zip(FIT_KEYS, kinetics, strict=True):
             low, high = FIT_BOUNDS[key]
             if not math.isfinite(value) or not low <= value <= high:
                 raise ValueError("热解参数超出主窗口输入范围。")
-    prefactor = 10 ** log_prefactor if kinetics is not None else 0.0
+    prefactor = 10 ** log_prefactor if single else 0.0
     activation = energy * 1000 / R
     char = yield_percent / 100
     half_dt = dt / 2
@@ -1002,7 +1105,14 @@ def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=Tru
 
     def react_half():
         total = 0.0
-        if prefactor:
+        gas = heat = 0.0
+        if network is not None:
+            for i, temp in enumerate(temperatures):
+                released, absorbed, _ = network.advance(i, temp, half_dt)
+                temperatures[i] -= absorbed / p.heat_capacity
+                gas += released
+                heat += absorbed
+        elif prefactor:
             for i, temp in enumerate(temperatures):
                 converted = (1.0 - reacted[i]) * -math.expm1(-prefactor * math.exp(-activation / temp) * half_dt)
                 reacted[i] += converted
@@ -1010,7 +1120,7 @@ def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=Tru
                 total += converted
         if any(not (1 < value < 3000) for value in temperatures):
             raise ValueError("温度超出当前模型的计算范围。可缩小时间步长并检查输入参数。")
-        return total
+        return gas + total * (1 - char), heat + total * PYROLYSIS_HEAT
 
     def boundary(source, convection, surface):
         h = convection + radiation * (surface + ambient) * (surface * surface + ambient * ambient)
@@ -1018,16 +1128,22 @@ def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=Tru
         return source / denominator, h / denominator
 
     def frame(time, loss_rate):
-        residual = tuple(100 * (1 - alpha * (1 - char)) for alpha in reacted)
+        composition = ()
+        if network is None:
+            residual = tuple(100 * (1 - alpha * (1 - char)) for alpha in reacted)
+        else:
+            residual = tuple(100 * sum(mass) for mass in network.mass)
+            composition = (*(100 * sum(column) / count for column in zip(*network.mass)),
+                           100 * vented / initial_mass)
         return SlabFrame(time, front - KELVIN, back - KELVIN,
                          (front - KELVIN, *(value - KELVIN for value in temperatures), back - KELVIN) if profiles else (),
-                         residual if profiles else (), sum(residual) / count, loss_rate)
+                         residual if profiles else (), sum(residual) / count, loss_rate, composition)
 
     frames = [frame(0, 0)]
     for step in range(1, steps + 1):
         if cancelled():
             raise FitCancelled()
-        conversion = react_half()
+        first_gas, first_heat = react_half()
         source_f, h_f = boundary(applied, p.front_h, front)
         source_b, h_b = boundary(0.0, p.back_h, back)
         factor = dt / capacity
@@ -1044,23 +1160,27 @@ def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=Tru
         q_f = source_f + h_f * (ambient - temperatures[0])
         q_b = source_b + h_b * (ambient - temperatures[-1])
         sum_boundary_heat += dt * (q_f + q_b)
-        conversion += react_half()
+        second_gas, second_heat = react_half()
         # Report surface values at the end of the full split step.
         front = temperatures[0] + (source_f + h_f * (ambient - temperatures[0])) * resistance
         back = temperatures[-1] + (source_b + h_b * (ambient - temperatures[-1])) * resistance
-        loss = conversion * (1 - char) * p.density * dx
+        loss = (first_gas + second_gas) * p.density * dx
         vented += loss
-        sum_reaction_heat += conversion * PYROLYSIS_HEAT * p.density * dx
+        sum_reaction_heat += (first_heat + second_heat) * p.density * dx
         loss_rate = 1000 * loss / dt
         peak_loss = max(peak_loss, loss_rate)
-        remaining = initial_mass - sum(reacted) * (1 - char) * p.density * dx
+        if network is None:
+            remaining = initial_mass - sum(reacted) * (1 - char) * p.density * dx
+        else:
+            remaining = sum(map(sum, network.mass)) * p.density * dx
         max_mass_error = max(max_mass_error, abs(remaining + vented - initial_mass) / initial_mass)
         sensible = capacity * sum(temp - ambient for temp in temperatures)
         max_energy_error = max(max_energy_error, abs(sensible + sum_reaction_heat - sum_boundary_heat))
         if step % sample_every == 0 or step == steps:
             frames.append(frame(step * dt, loss_rate))
 
-    return SlabResult(depth, tuple(frames), peak_loss, max_mass_error, max_energy_error)
+    return SlabResult(depth, tuple(frames), peak_loss, max_mass_error, max_energy_error,
+                      kinetics.names if network is not None else ())
 
 
 def export_slab(path, result):
@@ -1068,6 +1188,9 @@ def export_slab(path, result):
         writer = csv.writer(file)
         composition_columns = ["raw_solid_pct", "intermediate_pct", "char_pct", "released_volatile_pct"] \
             if result.frames[0].composition else []
+        if result.component_names:
+            composition_columns = ["component_" + name + "_pct" for name in result.component_names]
+            composition_columns.append("released_volatile_pct")
         writer.writerow(["time_s", "front_C", "back_C", "remaining_mass_pct", "mass_loss_g_m2_s"] +
                         [f"T_C_at_z_{depth:.6f}_mm" for depth in result.depth_mm[1:-1]] +
                         [f"solid_mass_pct_at_z_{depth:.6f}_mm" for depth in result.depth_mm[1:-1]] + composition_columns)
@@ -1079,6 +1202,8 @@ def export_slab(path, result):
 
 SLAB_HELP = """一维平板 · 惰性气氛
 从受热面 z = 0 沿厚度离散。初始温度与环境温度相同。正面输入恒定的吸收热通量，两面分别与环境对流，并使用同一发射率计算长波辐射换热。背面无外部热通量。其余方向按一维假设处理。
+
+「组分与反应表」可设置各凝聚相组分的初始质量分数和一阶 Arrhenius 反应。From 独立消耗，To 为凝聚相时其产率以所消耗质量的百分比表示，余量归入 gases。各组分共享平板热物性。在整体组分视图中可选组分或累计生成的 gases。
 
 单步模式使用主窗口的热解参数和固定热物性。两步模式在「多步反应与材料」中选择并联或串联，各步独立设置动力学、固体产率和吸热量。中间产物与残炭可配置密度、比热和导热系数，原材料热物性取自平板左栏。
 
@@ -1093,8 +1218,135 @@ SLAB_HELP = """一维平板 · 惰性气氛
 示例为合成参数。改变网格和步长可比较结果的数值收敛性。实际实验需用实测温度和质量损失验证参数及边界。"""
 
 
+class ReactionTableEditor:
+    """Edit both tables as a draft and apply them together after validation."""
+    def __init__(self, slab):
+        self.slab, self.tk, self.ttk = slab, slab.tk, slab.ttk
+        tk, ttk = self.tk, self.ttk
+        self.window = tk.Toplevel(slab.window)
+        self.window.title("组分与反应表")
+        self.window.geometry("940x530")
+        self.window.minsize(725, 380)
+        self.window.transient(slab.window)
+        body = ttk.Frame(self.window, padding=12)
+        body.pack(fill="both", expand=True)
+        self.tabs = ttk.Notebook(body)
+        self.tabs.pack(fill="both", expand=True)
+        self.rows = {"components": [], "reactions": []}
+        self.grids = {}
+        for key, title, hint, labels in (
+            ("components", "组分与初始质量分数",
+             "每行一个凝聚相组分。质量分数填 0–1，总和须为 1。只作为产物出现的组分填 0。",
+             ("组分名称", "初始质量分数")),
+            ("reactions", "From → To 反应",
+             "From、To 取组分表名称，纯气体产物写 gases 并将凝聚相产率填 0。其余产率按消耗质量计，余量进入气相。Z 可用科学计数法。反应热正值为吸热。",
+             ("From", "To", "Z (1/s)", "E (kJ/mol)", "凝聚相产率 (%)", "反应热 (kJ/kg)")),
+        ):
+            panel = ttk.Frame(self.tabs, padding=8)
+            self.tabs.add(panel, text=title)
+            slab.lab.text(panel, hint, bg=BG, fg=MUTED, wraplength=680, justify="left").pack(anchor="w")
+            actions = ttk.Frame(panel)
+            actions.pack(fill="x", pady=5)
+            ttk.Button(actions, text="添加一行", command=lambda k=key: self.add(k)).pack(side="left")
+            ttk.Button(actions, text="粘贴多行", command=lambda k=key: self.paste(k)).pack(side="left", padx=6)
+            area = ttk.Frame(panel)
+            area.pack(fill="both", expand=True)
+            canvas = tk.Canvas(area, bg=BG, highlightthickness=0)
+            scrollbar = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
+            scrollbar.pack(side="right", fill="y")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            canvas.pack(fill="both", expand=True)
+            grid = ttk.Frame(canvas)
+            item = canvas.create_window(0, 0, anchor="nw", window=grid)
+            grid.bind("<Configure>", lambda _, c=canvas: c.configure(scrollregion=c.bbox("all")))
+            canvas.bind("<Configure>", lambda event, c=canvas, item=item: c.itemconfigure(item, width=event.width))
+            for col, label in enumerate(labels):
+                grid.columnconfigure(col, weight=1)
+                ttk.Label(grid, text=label).grid(row=0, column=col, sticky="w")
+            self.grids[key] = grid
+        self.status = tk.StringVar(value="填写后点击「应用到平板」。可从电子表格复制与表头同序的数据行。")
+        slab.lab.text(body, value=self.status, bg=BG, fg=MUTED, wraplength=680).pack(anchor="w", pady=6)
+        actions = ttk.Frame(body)
+        actions.pack(fill="x")
+        ttk.Button(actions, text="应用到平板", command=self.apply, style="Primary.TButton").pack(side="right")
+        ttk.Button(actions, text="取消", command=self.window.destroy).pack(side="right", padx=6)
+        model = slab.mechanism
+        if isinstance(model, ReactionNetwork):
+            for item in model.components:
+                self.add("components", (item.name, item.initial))
+            for r in model.reactions:
+                self.add("reactions", (r.source, r.target, r.prefactor, r.energy, r.yield_pct, r.heat))
+        else:
+            self.add("components")
+            self.add("reactions")
+
+    def add(self, key, values=None):
+        grid = self.grids[key]
+        row = grid.grid_size()[1]
+        if values is None:
+            values = ("", "") if key == "components" else ("", "", "", "", "", "")
+        widgets = []
+        for col, value in enumerate(values):
+            field = self.ttk.Entry(grid, width=10)
+            field.grid(row=row, column=col, sticky="ew", padx=(0, 4), pady=2)
+            field.insert(0, str(value))
+            widgets.append(field)
+        delete = self.ttk.Button(grid, text="删除", width=5, command=lambda: self.remove(key, widgets))
+        delete.grid(row=row, column=len(values), padx=2)
+        widgets.append(delete)
+        self.rows[key].append(widgets)
+
+    def remove(self, key, widgets):
+        self.rows[key].remove(widgets)
+        for widget in widgets:
+            widget.destroy()
+
+    def paste(self, key):
+        try:
+            lines = self.window.clipboard_get().splitlines()
+        except self.tk.TclError:
+            self.status.set("剪贴板中没有文本。")
+            return
+        rows = [line.split("\t") for line in lines if line.strip()]
+        columns = 2 if key == "components" else 6
+        if not rows or any(len(row) != columns for row in rows):
+            self.status.set(f"复制数据行时请按本表顺序选择 {columns} 列，使用制表符分隔。")
+            return
+        for widgets in self.rows[key][:]:
+            if all(not field.get().strip() for field in widgets[:-1]):
+                self.remove(key, widgets)
+        for row in rows:
+            self.add(key, [value.strip() for value in row])
+        self.status.set(f"已添加 {len(rows)} 行。")
+
+    def read_rows(self, key, cls, text_columns):
+        records = []
+        for index, widgets in enumerate(self.rows[key], 1):
+            values = [field.get().strip() for field in widgets[:-1]]
+            try:
+                numbers = [float(value) for value in values[text_columns:]]
+            except ValueError as error:
+                name = "组分" if key == "components" else "反应"
+                raise ValueError(f"{name}第 {index} 行存在空白或无效数字。") from error
+            records.append(cls(*values[:text_columns], *numbers))
+        return tuple(records)
+
+    def apply(self):
+        try:
+            network = ReactionNetwork(self.read_rows("components", Component, 1),
+                                      self.read_rows("reactions", NetworkReaction, 2))
+            network.validate()
+        except ValueError as error:
+            self.status.set(str(error))
+            return
+        self.slab.mechanism = network
+        self.slab.refresh_label()
+        self.slab.mark_dirty()
+        self.window.destroy()
+
+
 class MechanismEditor:
-    LABELS = {"单步（主窗口参数）": None, "两步并联": "parallel", "两步串联": "series"}
+    LABELS = {"单步（主窗口参数）": None, "两步并联": "parallel", "两步串联": "series", "自定义反应表": "network"}
 
     def __init__(self, slab):
         self.slab = slab
@@ -1107,8 +1359,9 @@ class MechanismEditor:
         body = ttk.Frame(self.window, padding=14)
         body.pack(fill="both", expand=True)
         self.status = tk.StringVar()
-        current = slab.mechanism or SlabMechanism()
-        mode = slab.mechanism.mode if slab.mechanism else None
+        current = slab.mechanism if isinstance(slab.mechanism, SlabMechanism) else SlabMechanism()
+        mode = ("network" if isinstance(slab.mechanism, ReactionNetwork)
+                else slab.mechanism.mode if slab.mechanism else None)
         self.mode = tk.StringVar(value=next(name for name, value in self.LABELS.items() if value == mode))
         header = ttk.Frame(body)
         header.pack(fill="x")
@@ -1153,18 +1406,23 @@ class MechanismEditor:
         mode = self.LABELS[self.mode.get()]
         descriptions = {
             None: "单步取自主窗口的热解参数。原材料热物性在平板左栏设置。",
+            "network": "点击「应用到平板」进入逐行组分与反应编辑。",
             "parallel": "两条反应竞争消耗原材料，各自产生残炭和挥发物。原材料热物性取自平板左栏。",
             "series": "反应 1 生成中间产物，反应 2 消耗中间产物生成残炭。两步都可释放挥发物。",
         }
         self.hint.set(descriptions[mode])
         self.status.set("")
         for key, entries in self.groups.items():
-            enabled = mode is not None and (key != "intermediate" or mode == "series")
+            enabled = mode in ("parallel", "series") and (key != "intermediate" or mode == "series")
             for _, entry in entries.values():
                 entry.configure(state="normal" if enabled else "disabled")
 
     def apply(self):
         mode = self.LABELS[self.mode.get()]
+        if mode == "network":
+            self.window.destroy()
+            self.slab.open_table()
+            return
         mechanism = None
         if mode:
             def params(key, cls, label):
@@ -1257,7 +1515,12 @@ def inverse_fields(kinetics):
         ("conductivity", "原材料导热系数 (W/m·K)", .01, 400),
         ("heat_capacity", "原材料比热 (J/kg·K)", 300, 6000),
     ]
-    if isinstance(kinetics, SlabMechanism):
+    if isinstance(kinetics, ReactionNetwork):
+        for i, reaction in enumerate(kinetics.reactions):
+            prefix = f"反应 {i + 1} · {reaction.source} → {reaction.target}"
+            fields.extend(((f"{i}.energy", prefix + " · E (kJ/mol)", 0, max(500, reaction.energy * 2)),
+                           (f"{i}.log_z", prefix + " · log₁₀Z", -300, 300)))
+    elif isinstance(kinetics, SlabMechanism):
         for side, name in (("first", "反应 1"), ("second", "反应 2")):
             fields.extend((f"{side}.{key}", f"{name} · {label}", low, high)
                           for key, label, low, high in REACTION_FIELDS)
@@ -1269,6 +1532,9 @@ def inverse_fields(kinetics):
 def inverse_value(parameters, kinetics, key):
     if "." in key:
         side, field = key.split(".")
+        if isinstance(kinetics, ReactionNetwork):
+            reaction = kinetics.reactions[int(side)]
+            return math.log10(reaction.prefactor) if field == "log_z" else getattr(reaction, field)
         return getattr(getattr(kinetics, side), field)
     if key in FIT_KEYS:
         return kinetics[FIT_KEYS.index(key)]
@@ -1281,7 +1547,16 @@ def with_inverse_values(parameters, kinetics, keys, values):
     for key in ("density", "conductivity", "heat_capacity"):
         if key in selected:
             changes[key] = selected[key]
-    if isinstance(kinetics, SlabMechanism):
+    if isinstance(kinetics, ReactionNetwork):
+        rows = list(kinetics.reactions)
+        for key, value in selected.items():
+            if "." in key:
+                index, field = key.split(".")
+                i = int(index)
+                change = {"prefactor": 10 ** value} if field == "log_z" else {field: value}
+                rows[i] = replace(rows[i], **change)
+        kinetics = replace(kinetics, reactions=tuple(rows))
+    elif isinstance(kinetics, SlabMechanism):
         replacements = {}
         for side in ("first", "second"):
             reaction = {key.split(".")[1]: value for key, value in selected.items() if key.startswith(side + ".")}
@@ -1660,14 +1935,22 @@ class InverseWindow:
             self.lab.text(weight_panel, text, bg=BG, size=9).grid(row=row, column=col, sticky="w", padx=(0, 5))
             ttk.Entry(weight_panel, textvariable=var, width=7).grid(row=row, column=col + 1, padx=(0, 18), pady=1)
         self.note(self.fit_tab, "各指标按训练集观测范围归一化，工况等权；权重填 0 可停用该指标。验证沿用训练归一化系数，只在反演完成后计算。")
-        bounds = ttk.Frame(self.fit_tab)
-        bounds.pack(fill="x")
+        scroll = tk.Canvas(self.fit_tab, bg=BG, highlightthickness=0)
+        track = ttk.Scrollbar(self.fit_tab, orient="vertical", command=scroll.yview)
+        track.pack(side="right", fill="y")
+        scroll.configure(yscrollcommand=track.set)
+        scroll.pack(side="left", fill="both", expand=True)
+        bounds = ttk.Frame(scroll)
+        scroll.create_window(0, 0, window=bounds, anchor="nw")
+        bounds.bind("<Configure>", lambda _: scroll.configure(scrollregion=scroll.bbox("all")))
         for col, title in enumerate(("拟合参数", "下界", "上界")):
             self.lab.text(bounds, title, bg=BG, bold=True, size=9).grid(row=0, column=col, sticky="w", padx=(0, 8))
         self.bound_rows = {}
         for row, (key, label, lo, hi) in enumerate(inverse_fields(self.kinetics), 1):
             current = inverse_value(self.parameters, self.kinetics, key)
             span = abs(current) * .4 if current else (hi - lo) * .1
+            if key.endswith(".log_z"):
+                span = 1.0  # Search one decade either side of the supplied rate factor.
             low, high = max(lo, current - span), min(hi, current + span)
             enabled = tk.BooleanVar(value=key in ("conductivity", "heat_capacity"))
             bottom, top = tk.StringVar(value=f"{low:.7g}"), tk.StringVar(value=f"{high:.7g}")
@@ -1967,7 +2250,7 @@ class InverseWindow:
         for key in ("density", "conductivity", "heat_capacity"):
             if key in keys:
                 self.slab.inputs[key].set(f"{getattr(settings, key):.12g}")
-        if isinstance(reactions, SlabMechanism):
+        if isinstance(reactions, (SlabMechanism, ReactionNetwork)):
             self.slab.mechanism = reactions
         else:
             for key, value in zip(FIT_KEYS, reactions):
@@ -2094,7 +2377,8 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
     steps = math.ceil(p.duration / p.step)
     dt = p.duration / steps
     multi = isinstance(kinetics, SlabMechanism)
-    single = kinetics is not None and not multi
+    network = ReactionGrid(kinetics, count) if isinstance(kinetics, ReactionNetwork) else None
+    single = kinetics is not None and not multi and network is None
     if multi:
         validate_mechanism(kinetics)
         r1, r2 = kinetics.first, kinetics.second
@@ -2147,6 +2431,14 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
         return ref_capacity + 1200 * void, (mixed_k + .026 * void) / (solid_volume + void)
 
     def react_half(scale):
+        if network is not None:
+            for i, t in enumerate(temperature):
+                released, absorbed, consumed = network.advance(i, t, dt / 2)
+                gas[i] += released
+                temperature[i] -= absorbed / p.heat_capacity
+                raw[i] = max(0.0, raw[i] - consumed)
+            check_temperature()
+            return
         if not (single or multi):
             return
         for i, t in enumerate(temperature):
@@ -2217,7 +2509,10 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
                      for face in (0, -1))
 
     def frame(t, scale):
-        residual = tuple(100 * (u + v + w) for u, v, w in zip(raw, mid, char))
+        if network is None:
+            residual = tuple(100 * (u + v + w) for u, v, w in zip(raw, mid, char))
+        else:
+            residual = tuple(100 * sum(mass) for mass in network.mass)
         c = tuple(g * p.density / (f * scale) for g, f in zip(gas, pores()))
         return SectionFrame(t, p.thickness * scale, tuple(value - KELVIN for value in temperature),
                             residual, c, sum(residual) / count, 100 * sum(gas) / count,
@@ -2237,7 +2532,8 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
         out_f, out_b = transport(scale)
         front_out += out_f
         back_out += out_b
-        total = (sum(raw) + sum(mid) + sum(char) + sum(gas)) / count + front_out + back_out
+        condensed = sum(raw) + sum(mid) + sum(char) if network is None else sum(map(sum, network.mass))
+        total = (condensed + sum(gas)) / count + front_out + back_out
         mass_error = max(mass_error, abs(total - 1))
         if step % every == 0 or step == steps:
             frames.append(frame(step * dt, scale))
@@ -2321,7 +2617,7 @@ def export_profile(path, result, index):
 @dataclass(frozen=True)
 class SlabCase:
     parameters: SlabParameters
-    kinetics: tuple[float, ...] | SlabMechanism
+    kinetics: tuple[float, ...] | SlabMechanism | ReactionNetwork
     result: SlabResult | None
     probe_depth: float = 0.0
     view: str = "temperature"
@@ -2332,11 +2628,16 @@ class SlabCase:
 def save_slab_case(path, case):
     target = Path(path)
     temp_path = None
+    if isinstance(case.kinetics, ReactionNetwork):
+        case.kinetics.validate()
+        reactions = {"type": "network", "data": asdict(case.kinetics)}
+    elif isinstance(case.kinetics, SlabMechanism):
+        reactions = {"type": "multistep", "data": asdict(case.kinetics)}
+    else:
+        reactions = {"type": "single", "data": case.kinetics}
     payload = {
         "format": CASE_FORMAT, "version": CASE_VERSION, "parameters": asdict(case.parameters),
-        "kinetics": ({"type": "multistep", "data": asdict(case.kinetics)}
-                     if isinstance(case.kinetics, SlabMechanism)
-                     else {"type": "single", "data": case.kinetics}),
+        "kinetics": reactions,
         "result": asdict(case.result) if case.result else None,
         "view": {"probe_depth_mm": case.probe_depth, "plot": case.view, "time_index": case.time_index},
     }
@@ -2376,7 +2677,7 @@ def case_vector(data, size):
     return tuple(checked_case_number(value) for value in data)
 
 
-def decode_case_result(data, parameters, multistep):
+def decode_case_result(data, parameters, multistep, component_names=()):
     if not isinstance(data, dict):
         raise ValueError("算例结果格式有误。")
     count = int(parameters.cells)
@@ -2384,6 +2685,10 @@ def decode_case_result(data, parameters, multistep):
     expected = (0.0, *(parameters.thickness * (i + .5) / count for i in range(count)), parameters.thickness)
     if any(not math.isclose(a, b, rel_tol=1e-8, abs_tol=1e-8) for a, b in zip(depths, expected)):
         raise ValueError("算例结果的深度网格与设置不一致。")
+    stored_names = data.get("component_names", [])
+    if not isinstance(stored_names, list) or tuple(stored_names) != component_names:
+        raise ValueError("算例结果与反应表的组分顺序不一致。")
+    ncomp = len(component_names) + 1 if component_names else (4 if multistep else 0)
     rows = data.get("frames")
     if not isinstance(rows, list) or not 2 <= len(rows) <= 1602:
         raise ValueError("算例结果的采样数无效。")
@@ -2399,7 +2704,7 @@ def decode_case_result(data, parameters, multistep):
         previous = numbers["time"]
         temp = case_vector(row.get("temperature"), count + 2)
         residual = case_vector(row.get("residual"), count)
-        composition = case_vector(row.get("composition"), 4 if multistep else 0)
+        composition = case_vector(row.get("composition"), ncomp)
         if not math.isclose(temp[0], numbers["front"], abs_tol=1e-7) or not math.isclose(temp[-1], numbers["back"], abs_tol=1e-7):
             raise ValueError("算例的表面温度与温度剖面不一致。")
         if (any(not -1e-7 <= value <= 100 + 1e-7 for value in (*residual, *composition))
@@ -2407,7 +2712,7 @@ def decode_case_result(data, parameters, multistep):
                 or numbers["loss_rate"] < 0):
             raise ValueError("算例的局部剩余质量或质量损失率无效。")
         if composition and (abs(sum(composition) - 100) > 1e-6
-                            or abs(sum(composition[:3]) - numbers["remaining_mass"]) > 1e-6):
+                            or abs(sum(composition[:-1]) - numbers["remaining_mass"]) > 1e-6):
             raise ValueError("算例的组分与剩余质量不一致。")
         frames.append(SlabFrame(**numbers, temperature=temp, residual=residual, composition=composition))
     if frames[0].time != 0 or not math.isclose(previous, parameters.duration, abs_tol=1e-7):
@@ -2415,7 +2720,7 @@ def decode_case_result(data, parameters, multistep):
     summary = [checked_case_number(data.get(key)) for key in ("peak_loss", "mass_error", "energy_error")]
     if any(value < 0 for value in summary) or summary[0] + 1e-8 < max(frame.loss_rate for frame in frames):
         raise ValueError("算例结果的汇总数据无效。")
-    return SlabResult(expected, tuple(frames), *summary)
+    return SlabResult(expected, tuple(frames), *summary, component_names)
 
 
 def load_slab_case(path):
@@ -2433,11 +2738,31 @@ def load_slab_case(path):
     parameters = SlabParameters(**checked_case_fields(data.get("parameters"), (v[0] for v in SLAB_FIELDS)))
     validate_slab(parameters)
     reactions = data.get("kinetics")
-    if not isinstance(reactions, dict) or reactions.get("type") not in ("single", "multistep"):
+    if not isinstance(reactions, dict) or reactions.get("type") not in ("single", "multistep", "network"):
         raise ValueError("算例的反应模型格式有误。")
     multi = reactions["type"] == "multistep"
     source = reactions.get("data")
-    if multi:
+    component_names = ()
+    if reactions["type"] == "network":
+        if not isinstance(source, dict):
+            raise ValueError("算例缺少组分与反应表。")
+        def records(key, cls, strings):
+            rows = source.get(key)
+            if not isinstance(rows, list):
+                raise ValueError("组分或反应表格式错误。")
+            items = []
+            for row in rows:
+                if not isinstance(row, dict) or set(row) != set(cls.__dataclass_fields__):
+                    raise ValueError("组分或反应行的字段不完整。")
+                if any(not isinstance(row[k], str) for k in strings):
+                    raise ValueError("组分名称必须是文本。")
+                items.append(cls(**{k: v if k in strings else checked_case_number(v) for k, v in row.items()}))
+            return tuple(items)
+        kinetics = ReactionNetwork(records("components", Component, ("name",)),
+                                   records("reactions", NetworkReaction, ("source", "target")))
+        kinetics.validate()
+        component_names = kinetics.names
+    elif multi:
         if not isinstance(source, dict):
             raise ValueError("算例缺少多步反应参数。")
         reaction_fields = tuple(v[0] for v in REACTION_FIELDS)
@@ -2460,7 +2785,7 @@ def load_slab_case(path):
     depth = checked_case_number(view.get("probe_depth_mm"))
     if not 0 <= depth <= parameters.thickness:
         raise ValueError("算例测点不在平板范围内。")
-    result = decode_case_result(data["result"], parameters, multi) if data.get("result") is not None else None
+    result = decode_case_result(data["result"], parameters, multi, component_names) if data.get("result") is not None else None
     index = view.get("time_index")
     if type(index) is not int or not 0 <= index < (len(result.frames) if result else 1):
         raise ValueError("算例的剖面时刻无效。")
@@ -2485,7 +2810,7 @@ SECTION_QUANTITIES = {
 
 SECTION_HELP = """二维截面在惰性气氛中计算宽向 x 与厚向 z 的导热。受热面为 z = 0。正面中央条带输入平板设置的吸收热通量，两面均与环境对流和辐射换热。两侧绝热且封闭。单元中心温度和固体质量随时间输出。
 
-每次运行读取一维平板中当前的样品、传热、反应和时间设置。宽向与厚向网格数在本窗口单独指定。单步采用固定的参考热容和导热系数，两步采用组分热物性。反应产生的单一等效挥发物进入当地连通孔隙，再沿两个方向扩散。有效扩散系数为自由气体扩散系数乘以孔隙率的 1.5 次方。开放面取外部挥发物浓度为零，封闭面取零通量。结果计入孔内库存以及两面的净排出量。
+每次运行读取一维平板中当前的样品、传热、反应和时间设置。宽向与厚向网格数在本窗口单独指定。单步和自定义反应表采用固定的参考热容和导热系数，预设两步机制采用组分热物性。反应产生的单一等效挥发物进入当地连通孔隙，再沿两个方向扩散。有效扩散系数为自由气体扩散系数乘以孔隙率的 1.5 次方。开放面取外部挥发物浓度为零，封闭面取零通量。结果计入孔内库存以及两面的净排出量。
 
 完全转化厚度以初始厚度为 100%。例如 80% 表示缩至 0.8 倍，120% 表示膨胀至 1.2 倍。厚度随原材料平均转化率线性变化，宽度固定，各列同步伸缩。孔隙率则随各单元原材料转化率在两个输入端点间插值。几何伸缩和孔隙率是独立指定的经验关系。模型假设孔隙中的气体以扩散传质，忽略压力驱动流动、气体携热及变形功。
 
@@ -2772,6 +3097,7 @@ class SlabWindow:
         top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         lab.text(top, "一维平板热解", bg=BG, bold=True, size=18).pack(side="left")
         ttk.Button(top, text="边界与模型说明", command=self.help).pack(side="right")
+        ttk.Button(top, text="组分与反应表", command=self.open_table).pack(side="right", padx=(0, 7))
         ttk.Button(top, text="多步反应与材料", command=self.edit_mechanism).pack(side="right", padx=(0, 7))
         ttk.Button(top, text="多指标反演", command=self.open_inverse).pack(side="right", padx=(0, 7))
         ttk.Button(top, text="二维截面", command=self.open_section).pack(side="right", padx=(0, 7))
@@ -2826,6 +3152,8 @@ class SlabWindow:
         self.plot_choice.set(SLAB_VIEWS[self.mode.get()])
         self.plot_choice.pack(side="left", padx=(0, 6))
         self.plot_choice.bind("<<ComboboxSelected>>", self.select_view)
+        self.component_choice = ttk.Combobox(tabs, state="readonly", width=16)
+        self.component_choice.bind("<<ComboboxSelected>>", lambda _: self.draw())
         lab.text(tabs, "测点 (mm)", size=9).pack(side="left", padx=(0, 3))
         probe = ttk.Entry(tabs, textvariable=self.probe_input, width=7)
         probe.pack(side="left", padx=(0, 3))
@@ -2871,12 +3199,19 @@ class SlabWindow:
             self.refresh_label()
             self.mark_dirty()
 
+    def open_table(self):
+        self.open_editor(ReactionTableEditor)
+
     def edit_mechanism(self):
+        self.open_editor(MechanismEditor)
+
+    def open_editor(self, editor_type):
         editor = getattr(self, "editor", None)
         if editor is not None and editor.window.winfo_exists():
             editor.window.lift()
             return
-        self.editor = MechanismEditor(self)
+        self.editor = editor_type(self)
+        self.editor.window.grab_set()
 
     def help(self):
         popup = self.tk.Toplevel(self.window)
@@ -2893,6 +3228,10 @@ class SlabWindow:
         return tuple(float(self.lab.inputs[key].get()) for key in FIT_KEYS)
 
     def refresh_label(self):
+        if isinstance(self.mechanism, ReactionNetwork):
+            self.kinetics_label.set(f"自定义模型 · {len(self.mechanism.components)} 种组分"
+                                    f" · {len(self.mechanism.reactions)} 条反应 · 共用平板热物性")
+            return
         if self.mechanism is not None:
             mode = "两步并联" if self.mechanism.mode == "parallel" else "两步串联"
             self.kinetics_label.set(f"{mode} · 随组分更新热物性")
@@ -2928,7 +3267,7 @@ class SlabWindow:
             return
         try:
             parameters, kinetics = self.parameter_snapshot(), self.current_kinetics()
-            if isinstance(kinetics, SlabMechanism):
+            if isinstance(kinetics, (SlabMechanism, ReactionNetwork)):
                 validate_mechanism(kinetics)
             else:
                 for key, value in zip(FIT_KEYS, kinetics):
@@ -2981,7 +3320,7 @@ class SlabWindow:
             if item[0] == "done":
                 _, result, self.solved_settings = item
                 self.show_result(result, len(result.frames) - 1)
-                mode = "随组分更新热物性" if self.result.frames[-1].composition else "固定热物性"
+                mode = "随组分更新热物性" if isinstance(self.solved_settings[1], SlabMechanism) else "固定热物性"
                 self.status.set(f"计算完成 · 惰性气氛 · 固定厚度 · {mode}")
                 if self.dirty:
                     self.status.set("已显示上次输入的结果，运行模拟以更新修改后的参数。")
@@ -3097,7 +3436,7 @@ class SlabWindow:
                 self.section_settings = self.section_window.settings()
             parameters = self.parameter_snapshot()
             kinetics = self.current_kinetics()
-            if isinstance(kinetics, SlabMechanism):
+            if isinstance(kinetics, (SlabMechanism, ReactionNetwork)):
                 validate_mechanism(kinetics)
             elif any(not FIT_BOUNDS[key][0] <= value <= FIT_BOUNDS[key][1]
                      for key, value in zip(FIT_KEYS, kinetics)):
@@ -3138,7 +3477,7 @@ class SlabWindow:
         self.section_settings = case.section
         for key, variable in self.inputs.items():
             variable.set(str(getattr(case.parameters, key)))
-        if isinstance(case.kinetics, SlabMechanism):
+        if isinstance(case.kinetics, (SlabMechanism, ReactionNetwork)):
             self.mechanism = case.kinetics
         else:
             self.mechanism = None
@@ -3172,6 +3511,15 @@ class SlabWindow:
             return
         mode = self.mode.get()
         self.plot_choice.set(SLAB_VIEWS[mode])
+        if self.result and self.result.component_names and mode == "composition":
+            names = (*self.result.component_names, "gases")
+            self.component_choice.configure(values=names)
+            if self.component_choice.get() not in names:
+                self.component_choice.current(0)
+            if not self.component_choice.winfo_manager():
+                self.component_choice.pack(side="left", after=self.plot_choice, padx=(0, 6))
+        else:
+            self.component_choice.pack_forget()
         self.update_exports()
         if self.result is None:
             self.scale.configure(state="disabled")
@@ -3205,13 +3553,17 @@ class SlabWindow:
                 traces = [("剩余质量", NITROGEN, tuple(f.remaining_mass for f in frames))]
             elif mode == "composition":
                 if not frames[0].composition:
-                    canvas.create_text(w / 2, h / 2, text="使用两步反应运行后显示组分", fill=MUTED)
+                    canvas.create_text(w / 2, h / 2, text="使用两步反应或自定义反应表运行后显示组分", fill=MUTED)
                     return
                 yname = "组分占初始质量 (%)"
                 labels = (("原材料", FURNACE), ("中间产物", "#794e99"),
                           ("残炭", AIR), ("挥发物", NITROGEN))
-                traces = [(name, color, tuple(f.composition[i] for f in frames))
-                          for i, (name, color) in enumerate(labels)]
+                if self.result.component_names:
+                    i = self.component_choice.current()
+                    traces = [(self.component_choice.get(), NITROGEN, tuple(f.composition[i] for f in frames))]
+                else:
+                    traces = [(name, color, tuple(f.composition[i] for f in frames))
+                              for i, (name, color) in enumerate(labels)]
             elif mode == "loss":
                 yname = "质量损失率 (g/(m²·s))"
                 traces = [("失重率", AIR, tuple(f.loss_rate for f in frames))]

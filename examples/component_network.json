@@ -1,0 +1,73 @@
+{
+  "format": "pyro-ignition-lab/slab",
+  "version": 1,
+  "parameters": {
+    "thickness": 8.0,
+    "density": 550.0,
+    "conductivity": 0.19,
+    "heat_capacity": 1550.0,
+    "flux": 16.0,
+    "front_h": 10.0,
+    "back_h": 18.0,
+    "emissivity": 0.85,
+    "ambient": 25.0,
+    "duration": 360.0,
+    "cells": 40,
+    "step": 0.2
+  },
+  "kinetics": {
+    "type": "network",
+    "data": {
+      "components": [
+        {
+          "name": "feed_A",
+          "initial": 0.6
+        },
+        {
+          "name": "feed_B",
+          "initial": 0.4
+        },
+        {
+          "name": "middle",
+          "initial": 0
+        },
+        {
+          "name": "residue",
+          "initial": 0
+        }
+      ],
+      "reactions": [
+        {
+          "source": "feed_A",
+          "target": "gases",
+          "prefactor": 1000000.0,
+          "energy": 72,
+          "yield_pct": 0,
+          "heat": 180
+        },
+        {
+          "source": "feed_B",
+          "target": "middle",
+          "prefactor": 20000000.0,
+          "energy": 90,
+          "yield_pct": 80,
+          "heat": 120
+        },
+        {
+          "source": "middle",
+          "target": "residue",
+          "prefactor": 4000000.0,
+          "energy": 86,
+          "yield_pct": 35,
+          "heat": 90
+        }
+      ]
+    }
+  },
+  "result": null,
+  "view": {
+    "probe_depth_mm": 0.0,
+    "plot": "composition",
+    "time_index": 0
+  }
+}
