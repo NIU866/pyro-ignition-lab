@@ -13,7 +13,7 @@ import random
 import sys
 import tempfile
 import threading
-from dataclasses import asdict, dataclass, replace
+from dataclasses import MISSING, asdict, dataclass, fields, replace
 from pathlib import Path
 
 R = 8.314462618
@@ -796,19 +796,89 @@ class Component:
 
 
 @dataclass(frozen=True)
+class SpeciesThermal:
+    name: str
+    density: float          # bulk density at Tr, kg/m³
+    heat_capacity: float    # baseline at Tr, J/(kg K)
+    conductivity: float     # baseline at Tr, W/(m K)
+    emissivity: float
+    density_exponent: float = 0.0
+    capacity_exponent: float = 0.0
+    conductivity_exponent: float = 0.0
+    pore_length: float = 0.0        # gamma in Eq. 7, metres
+    melt_heat: float = 0.0          # J/kg of this species
+    melt_temperature: float = 300.0 # K
+    melt_variance: float = 1.0      # sigma_m squared, K²
+
+    def validate(self):
+        numbers = (getattr(self, f.name) for f in fields(self) if f.name != "name")
+        if (not all(math.isfinite(x) for x in numbers) or
+                min(self.density, self.heat_capacity, self.conductivity, self.melt_temperature, self.melt_variance) <= 0 or
+                not 0 <= self.emissivity <= 1 or self.pore_length < 0 or self.melt_heat < 0):
+            raise ValueError(f"组分 {self.name} 的热物性无效。密度、比热、导热、熔点和峰方差须大于 0，"
+                             "发射率为 0–1，γ 和熔化潜热须非负。")
+
+    def bulk_density(self, t, tr):
+        return self.density * (t / tr) ** self.density_exponent
+
+    def effective_k(self, t, tr):
+        return self.conductivity * (t / tr) ** self.conductivity_exponent + self.pore_length * STEFAN_BOLTZMANN * t**3
+
+    def cp(self, t, tr):
+        value = self.heat_capacity * (t / tr) ** self.capacity_exponent
+        if self.melt_heat:
+            offset = (t - self.melt_temperature) / math.sqrt(self.melt_variance)
+            value += self.melt_heat / math.sqrt(2 * math.pi * self.melt_variance) * math.exp(-.5 * offset**2)
+        return value
+
+    def sensible_change(self, a, b, tr):
+        """Integral of apparent cp from a to b, including the n = -1 limit."""
+        if self.capacity_exponent == 0:
+            change = self.heat_capacity * (b - a)
+        else:
+            power = self.capacity_exponent + 1
+            log_ratio = math.log1p((b - a) / a)
+            integral = math.expm1(power * log_ratio) / power if power else log_ratio
+            change = self.heat_capacity * (a / tr) ** self.capacity_exponent * a * integral
+        if self.melt_heat:
+            width = math.sqrt(2 * self.melt_variance)
+            change += .5 * self.melt_heat * (math.erf((b - self.melt_temperature) / width)
+                                             - math.erf((a - self.melt_temperature) / width))
+        return change
+
+
+@dataclass(frozen=True)
 class NetworkReaction:
     source: str
     target: str     # a condensed component or "gases"
     prefactor: float  # Z in 1/s
     energy: float     # kJ/mol
     yield_pct: float  # condensed product per consumed mass
-    heat: float       # effective kJ/kg of reactant consumed, endothermic positive
+    heat: float | None = None  # effective kJ/kg consumed, or separate heats below
+    solid_heat: float | None = None  # J/kg condensed product formed
+    gas_heat: float | None = None    # J/kg volatilized from the condensed phase
+
+    def absorbed_per_kg(self):
+        if self.heat is not None:
+            if self.solid_heat is not None or self.gas_heat is not None:
+                raise ValueError("有效反应热与分项反应热只能填写一种。")
+            value = self.heat * 1000
+        else:
+            if self.solid_heat is None or self.gas_heat is None or not all(map(math.isfinite, (self.solid_heat, self.gas_heat))):
+                raise ValueError("分项模式须同时填写 ΔHsol 和 ΔHvol（J/kg 对应产物）。")
+            retained = self.yield_pct / 100
+            value = retained * self.solid_heat + (1 - retained) * self.gas_heat
+        if not math.isfinite(value):
+            raise ValueError("反应热须为有限数值。")
+        return value
 
 
 @dataclass(frozen=True)
 class ReactionNetwork:
     components: tuple[Component, ...]
     reactions: tuple[NetworkReaction, ...]
+    materials: tuple[SpeciesThermal, ...] = ()
+    reference_temperature: float = 298.15    # K, for species property correlations
 
     @property
     def names(self):
@@ -829,14 +899,25 @@ class ReactionNetwork:
         total = math.fsum(item.initial for item in self.components)
         if abs(total - 1) > 1e-9:
             raise ValueError(f"初始质量分数之和为 {total:.10g}，应为 1。")
+        if not math.isfinite(self.reference_temperature) or self.reference_temperature <= 0:
+            raise ValueError("热物性参考温度必须是大于 0 的开尔文温度。")
+        if self.materials:
+            if {m.name for m in self.materials} != seen or len(self.materials) != len(seen):
+                raise ValueError("热物性表须为每种凝聚相组分填写且只填写一行，包括初始质量为 0 的产物。")
+            for material in self.materials:
+                material.validate()
         for i, r in enumerate(self.reactions, 1):
             if r.source not in seen or (r.target != "gases" and r.target not in seen):
                 raise ValueError(f"反应第 {i} 行 From 或 To 名称未在组分表定义。")
             if r.source == r.target:
                 raise ValueError(f"反应第 {i} 行的 From 与 To 相同。")
             if not (math.isfinite(r.prefactor) and r.prefactor > 0 and math.isfinite(r.energy)
-                    and r.energy >= 0 and math.isfinite(r.heat) and 0 <= r.yield_pct <= 100):
+                    and r.energy >= 0 and 0 <= r.yield_pct <= 100):
                 raise ValueError(f"反应第 {i} 行需满足 Z > 0、E ≥ 0、凝聚相产率 0–100%，反应热须为有限数值。")
+            try:
+                r.absorbed_per_kg()
+            except ValueError as error:
+                raise ValueError(f"反应第 {i} 行：{error}") from error
             if r.target == "gases" and r.yield_pct != 0:
                 raise ValueError(f"反应第 {i} 行产物为 gases，凝聚相产率应为 0%。")
 
@@ -849,7 +930,7 @@ class ReactionGrid:
         groups = {}
         for r in network.reactions:
             groups.setdefault(indices[r.source], []).append(
-                (indices.get(r.target), r.prefactor, r.energy * (1000 / R), r.yield_pct / 100, r.heat * 1000))
+                (indices.get(r.target), r.prefactor, r.energy * (1000 / R), r.yield_pct / 100, r.absorbed_per_kg()))
         self.groups = tuple(groups.items())
         total = math.fsum(item.initial for item in network.components)
         initial = [item.initial / total for item in network.components]
@@ -884,6 +965,157 @@ class ReactionGrid:
         for i, value in enumerate(produced):
             mass[i] += value
         return gas, heat, original_consumed
+
+
+@dataclass(frozen=True)
+class CellThermal:
+    """Sensible storage per original volume for a fixed composition and geometry."""
+    tr: float
+    species_mass: tuple   # (material, kg per original m³)
+    void_capacity: float
+    conductivity: float
+    emissivity: float
+
+    def capacity(self, t):
+        return self.void_capacity + sum(mass * m.cp(t, self.tr) for m, mass in self.species_mass)
+
+    def energy(self, a, b):
+        return self.void_capacity * (b - a) + sum(
+            mass * m.sensible_change(a, b, self.tr) for m, mass in self.species_mass)
+
+    def temperature_after(self, start, heat):
+        lo, hi = 1.0, 3000.0
+        guess = start
+        tol = 5e-7 + 1e-11 * abs(heat)
+        for _ in range(60):
+            error = self.energy(start, guess) - heat
+            if abs(error) <= tol:
+                return guess, error
+            if error > 0:
+                hi = guess
+            else:
+                lo = guess
+            proposed = guess - error / self.capacity(guess)
+            guess = proposed if lo < proposed < hi else (lo + hi) / 2
+        raise ValueError("反应热对应的温度超出 1–3000 K 或焓迭代未收敛。请检查反应热单位和时间步长。")
+
+
+class SolidMixture:
+    """Bulk species properties (Gpyro v0.800, Sec. 2), on the lab's prescribed grid."""
+    def __init__(self, model, initial_t):
+        by_name = {m.name: m for m in model.materials}
+        self.materials = tuple(by_name[name] for name in model.names)
+        self.tr = model.reference_temperature
+        total = sum(c.initial for c in model.components)
+        self.initial_density = total / sum(
+            c.initial / m.bulk_density(initial_t, self.tr) for c, m in zip(model.components, self.materials))
+
+    def cell(self, mass, temperature, stretch):
+        active = tuple((m, self.initial_density * w) for m, w in zip(self.materials, mass) if w > 0)
+        volumes = [w / m.bulk_density(temperature, self.tr) for m, w in active]
+        occupied = sum(volumes)
+        # Species densities are bulk densities, already including their internal pores.
+        # Only vacant grid volume left outside the bulk species receives the gas proxy.
+        vacant = max(0.0, stretch - occupied)
+        mixed_k = sum(v * m.effective_k(temperature, self.tr) for v, (m, _) in zip(volumes, active))
+        k = (mixed_k + .026 * vacant) / (occupied + vacant)
+        eps = sum(v * m.emissivity for v, (m, _) in zip(volumes, active)) / occupied if occupied else 0.0
+        return CellThermal(self.tr, active, 1200.0 * vacant, k, eps)
+
+    def react(self, grid, i, t, dt, stretch):
+        before = grid.mass[i].copy()
+        gas, absorbed, original = grid.advance(i, t, dt)
+        if absorbed == 0:
+            return t, gas, original, 0.0
+        midpoint = [(a + b) / 2 for a, b in zip(before, grid.mass[i])]
+        state = self.cell(midpoint, t, stretch)
+        temperature, balance = state.temperature_after(t, -absorbed * self.initial_density)
+        return temperature, gas, original, balance
+
+
+def material_heat_line(temperature, states, line, dt_ref, spacing, boundaries):
+    """Backward Euler in sensible enthalpy, with fixed conductances for this sweep."""
+    old = [temperature[i] for i in line]
+    cells = [states[i] for i in line]
+    factor = dt_ref / spacing**2
+    links = [factor * 2 / (1 / a.conductivity + 1 / b.conductivity) for a, b in zip(cells, cells[1:])]
+    off = [-g for g in links]
+    diagonal = [l + r for l, r in zip([0.0, *links], [*links, 0.0])]
+    faces = []
+    for j, sink, source in boundaries:
+        coeff = dt_ref / spacing
+        diagonal[j] += coeff * sink
+        faces.append((j, coeff * sink, coeff * source))
+
+    def residual(values):
+        out = [cell.energy(a, b) for cell, a, b in zip(cells, old, values)]
+        for j, g in enumerate(links):
+            transfer = g * (values[j] - values[j + 1])
+            out[j] += transfer
+            out[j + 1] -= transfer
+        for j, sink, source in faces:
+            out[j] += sink * values[j] - source
+        return out
+
+    trial = old
+    errors = residual(trial)
+    initial_norm = max(map(abs, errors))
+    tolerance = 5e-7 + 1e-11 * initial_norm
+    for _ in range(40):
+        norm = max(map(abs, errors))
+        if norm <= tolerance:
+            for i, value in zip(line, trial):
+                temperature[i] = value
+            return sum(errors)
+        tangent = [d + cell.capacity(t) for d, cell, t in zip(diagonal, cells, trial)]
+        change = tridiagonal_solve(tangent, [-e for e in errors], off, off)
+        # A Newton step may jump across a narrow melting peak. Backtrack on the
+        # actual energy residual until it falls, retaining the positive-K domain.
+        step = 1.0
+        for _ in range(28):
+            candidate = [t + step * delta for t, delta in zip(trial, change)]
+            if all(1 < t < 3000 for t in candidate):
+                updated = residual(candidate)
+                if max(map(abs, updated)) < norm:
+                    trial, errors = candidate, updated
+                    break
+            step *= .5
+        else:
+            break
+    raise ValueError("导热焓迭代未收敛或超出 1–3000 K，请检查输入的热物性、边界和时间步长。")
+
+
+def material_heat_step(mixture, mass, temperature, scale, rows, columns, dt, dx, dz0,
+                       p, flux, front, back):
+    """Shared x/z heat update. In 1D the x sweep is omitted."""
+    states = [mixture.cell(m, t, scale) for m, t in zip(mass, temperature)]
+    dt_ref = dt * scale  # storage is measured per initial volume
+    for line in rows:
+        material_heat_line(temperature, states, line, dt_ref, dx, ())
+    ambient = p.ambient + KELVIN
+    dz = dz0 * scale
+    balance = 0.0
+    surface_terms = []
+    for column_index, line in enumerate(columns):
+        boundaries = []
+        for j, face, applied, h in ((0, front, flux[column_index], p.front_h),
+                                    (-1, back, 0.0, p.back_h)):
+            i = line[j]
+            t = face[column_index]
+            radiation = STEFAN_BOLTZMANN * states[i].emissivity * (t + ambient) * (t*t + ambient*ambient)
+            h += radiation
+            resistance = dz / (2 * states[i].conductivity)
+            factor = 1 + h * resistance
+            sink, source = h / factor, (applied + h * ambient) / factor
+            boundaries.append((j, sink, source))
+            surface_terms.append((face, column_index, i, resistance, sink, source))
+        balance += material_heat_line(temperature, states, line, dt_ref, dz, boundaries)
+    return balance, surface_terms
+
+
+def update_material_surfaces(temperature, terms):
+    for face, column, i, resistance, sink, source in terms:
+        face[column] = temperature[i] + resistance * (source - sink * temperature[i])
 
 
 REACTION_FIELDS = (
@@ -1058,8 +1290,58 @@ def validate_slab(parameters):
                              (" 的整数。" if key == "cells" else "。"))
 
 
+def slab_simulate_materials(p, model, cancelled, profiles):
+    count = int(p.cells)
+    steps = math.ceil(p.duration / p.step)
+    dt = p.duration / steps
+    dz = p.thickness / (1000 * count)
+    ambient = p.ambient + KELVIN
+    grid = ReactionGrid(model, count)
+    mixture = SolidMixture(model, ambient)
+    cell_mass = mixture.initial_density * dz
+    depths = (0.0, *(p.thickness * (i + .5) / count for i in range(count)), p.thickness)
+    temperature = [ambient] * count
+    front, back = [ambient], [ambient]
+    columns, flux = (range(count),), (p.flux * 1000,)
+    sample_every = max(1, math.ceil(steps / 1500))
+    generated = peak = mass_error = energy_error = 0.0
+
+    def react():
+        gas = balance = 0.0
+        for i, t in enumerate(temperature):
+            temperature[i], released, _, error = mixture.react(grid, i, t, dt / 2, 1.0)
+            gas += released
+            balance += error
+        return gas, balance
+
+    def frame(time, rate):
+        solids = tuple(100 * sum(part) / count for part in zip(*grid.mass))
+        values = (front[0] - KELVIN, *(t - KELVIN for t in temperature), back[0] - KELVIN) if profiles else ()
+        residue = tuple(100 * sum(m) for m in grid.mass) if profiles else ()
+        return SlabFrame(time, front[0] - KELVIN, back[0] - KELVIN, values, residue, sum(solids),
+                         rate, (*solids, 100 * generated / count))
+
+    frames = [frame(0, 0)]
+    for index in range(1, steps + 1):
+        if cancelled():
+            raise FitCancelled()
+        gas1, error1 = react()
+        error_t, faces = material_heat_step(mixture, grid.mass, temperature, 1.0, (), columns, dt, dz, dz,
+                                            p, flux, front, back)
+        gas2, error2 = react()
+        update_material_surfaces(temperature, faces)
+        generated += gas1 + gas2
+        rate = (gas1 + gas2) * cell_mass * 1000 / dt
+        peak = max(peak, rate)
+        mass_error = max(mass_error, abs((sum(map(sum, grid.mass)) + generated) / count - 1))
+        energy_error = max(energy_error, abs(error1 + error_t + error2) * dz)
+        if index % sample_every == 0 or index == steps:
+            frames.append(frame(index * dt, rate))
+    return SlabResult(depths, tuple(frames), peak, mass_error, energy_error, model.names)
+
+
 def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=True):
-    """One-dimensional inert slab with fixed geometry and constant thermal properties.
+    """One-dimensional inert slab with fixed geometry.
 
     Finite-volume backward Euler diffusion with reaction half-steps. Boundary
     transfer uses a half-cell resistance and a lagged radiation coefficient.
@@ -1069,6 +1351,8 @@ def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=Tru
     if isinstance(kinetics, SlabMechanism):
         return slab_simulate_multistep(parameters, kinetics, cancelled, profiles)
     validate_slab(parameters)
+    if isinstance(kinetics, ReactionNetwork) and kinetics.materials:
+        return slab_simulate_materials(parameters, kinetics, cancelled, profiles)
     p = parameters
     count = int(p.cells)
     steps = math.ceil(p.duration / p.step)
@@ -1201,9 +1485,11 @@ def export_slab(path, result):
 
 
 SLAB_HELP = """一维平板 · 惰性气氛
-从受热面 z = 0 沿厚度离散。初始温度与环境温度相同。正面输入恒定的吸收热通量，两面分别与环境对流，并使用同一发射率计算长波辐射换热。背面无外部热通量。其余方向按一维假设处理。
+从受热面 z = 0 沿厚度离散。初始温度与环境温度相同。正面输入恒定的吸收热通量，两面分别与环境对流，并按各侧的表面发射率计算长波辐射换热。背面无外部热通量。其余方向按一维假设处理。
 
-「组分与反应表」可设置各凝聚相组分的初始质量分数和一阶 Arrhenius 反应。From 独立消耗，To 为凝聚相时其产率以所消耗质量的百分比表示，余量归入 gases。各组分共享平板热物性。在整体组分视图中可选组分或累计生成的 gases。
+「组分与反应表」可设置各凝聚相组分的初始质量分数和一阶 Arrhenius 反应。From 独立消耗，To 为凝聚相时其产率以所消耗质量的百分比表示，余量归入 gases。有效热按消耗量计（kJ/kg）。用分项热时，ΔHsol 和 ΔHvol 分别按生成的凝聚相产物、挥发物质量计（J/kg），正值吸热。
+
+「组分热物性」可逐行设置参考密度、比热、导热和发射率，各组分使用同一个开尔文参考温度。可选温度幂指数、孔隙辐射导热和熔化吸热峰。比热按质量加权，导热和表面发射率按组分体积加权。表为空时共用平板热物性。在整体组分视图中可选组分或累计生成的 gases。
 
 单步模式使用主窗口的热解参数和固定热物性。两步模式在「多步反应与材料」中选择并联或串联，各步独立设置动力学、固体产率和吸热量。中间产物与残炭可配置密度、比热和导热系数，原材料热物性取自平板左栏。
 
@@ -1219,28 +1505,39 @@ SLAB_HELP = """一维平板 · 惰性气氛
 
 
 class ReactionTableEditor:
-    """Edit both tables as a draft and apply them together after validation."""
+    """Edit the material model as a draft; apply all validated tables together."""
+    THERMAL_LABELS = ("组分名称", "ρ₀ (kg/m³)", "c₀ (J/kg/K)", "k₀ (W/m/K)", "ε", "nρ", "nc", "nk",
+                      "γ (m)", "ΔHm (J/kg)", "Tm (K)", "σm² (K²)")
+    WIDTHS = {"components": 2, "reactions": 8, "materials": len(THERMAL_LABELS)}
+
     def __init__(self, slab):
         self.slab, self.tk, self.ttk = slab, slab.tk, slab.ttk
         tk, ttk = self.tk, self.ttk
         self.window = tk.Toplevel(slab.window)
         self.window.title("组分与反应表")
-        self.window.geometry("940x530")
+        self.window.geometry("1000x555")
         self.window.minsize(725, 380)
         self.window.transient(slab.window)
         body = ttk.Frame(self.window, padding=12)
         body.pack(fill="both", expand=True)
         self.tabs = ttk.Notebook(body)
         self.tabs.pack(fill="both", expand=True)
-        self.rows = {"components": [], "reactions": []}
+        self.rows = {key: [] for key in self.WIDTHS}
         self.grids = {}
+        model = slab.mechanism
+        self.reference = tk.StringVar(value=str(model.reference_temperature if isinstance(model, ReactionNetwork) else 298.15))
         for key, title, hint, labels in (
             ("components", "组分与初始质量分数",
              "每行一个凝聚相组分。质量分数填 0–1，总和须为 1。只作为产物出现的组分填 0。",
              ("组分名称", "初始质量分数")),
             ("reactions", "From → To 反应",
-             "From、To 取组分表名称，纯气体产物写 gases 并将凝聚相产率填 0。其余产率按消耗质量计，余量进入气相。Z 可用科学计数法。反应热正值为吸热。",
-             ("From", "To", "Z (1/s)", "E (kJ/mol)", "凝聚相产率 (%)", "反应热 (kJ/kg)")),
+             "To 为 gases 时凝聚相产率填 0%。有效热按每千克反应物填写。使用分项热时留空有效热，"
+             "同时填 ΔHsol（每千克凝聚相产物）和 ΔHvol（每千克挥发物）。正值吸热，负值放热。",
+             ("From", "To", "Z (1/s)", "E (kJ/mol)", "凝聚相产率 (%)", "有效热 (kJ/kg)", "ΔHsol (J/kg)", "ΔHvol (J/kg)")),
+            ("materials", "组分热物性",
+             "按组分补齐可从当前平板参数开始。填前 5 列即可用常物性，右侧可填温度指数、孔隙辐射长度和熔化峰。"
+             "熔化峰宽输入方差 σm²（K²）。热物性表无数据时沿用平板公共参数。",
+             self.THERMAL_LABELS),
         ):
             panel = ttk.Frame(self.tabs, padding=8)
             self.tabs.add(panel, text=title)
@@ -1249,17 +1546,28 @@ class ReactionTableEditor:
             actions.pack(fill="x", pady=5)
             ttk.Button(actions, text="添加一行", command=lambda k=key: self.add(k)).pack(side="left")
             ttk.Button(actions, text="粘贴多行", command=lambda k=key: self.paste(k)).pack(side="left", padx=6)
+            if key == "materials":
+                ttk.Button(actions, text="按组分补齐", command=self.fill_materials).pack(side="left")
+                ttk.Label(actions, text="参考温度 Tr (K)").pack(side="left", padx=(14, 4))
+                ttk.Entry(actions, width=9, textvariable=self.reference).pack(side="left")
             area = ttk.Frame(panel)
             area.pack(fill="both", expand=True)
+            area.columnconfigure(0, weight=1)
+            area.rowconfigure(0, weight=1)
             canvas = tk.Canvas(area, bg=BG, highlightthickness=0)
-            scrollbar = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
-            scrollbar.pack(side="right", fill="y")
-            canvas.configure(yscrollcommand=scrollbar.set)
-            canvas.pack(fill="both", expand=True)
+            scroll_y = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
+            scroll_x = ttk.Scrollbar(area, orient="horizontal", command=canvas.xview)
+            scroll_y.grid(row=0, column=1, sticky="ns")
+            scroll_x.grid(row=1, column=0, sticky="ew")
+            canvas.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+            canvas.grid(row=0, column=0, sticky="nsew")
             grid = ttk.Frame(canvas)
             item = canvas.create_window(0, 0, anchor="nw", window=grid)
-            grid.bind("<Configure>", lambda _, c=canvas: c.configure(scrollregion=c.bbox("all")))
-            canvas.bind("<Configure>", lambda event, c=canvas, item=item: c.itemconfigure(item, width=event.width))
+            def resize(_, c=canvas, g=grid, item=item):
+                c.itemconfigure(item, width=max(c.winfo_width(), g.winfo_reqwidth()))
+                c.configure(scrollregion=c.bbox("all"))
+            grid.bind("<Configure>", resize)
+            canvas.bind("<Configure>", resize)
             for col, label in enumerate(labels):
                 grid.columnconfigure(col, weight=1)
                 ttk.Label(grid, text=label).grid(row=0, column=col, sticky="w")
@@ -1270,29 +1578,27 @@ class ReactionTableEditor:
         actions.pack(fill="x")
         ttk.Button(actions, text="应用到平板", command=self.apply, style="Primary.TButton").pack(side="right")
         ttk.Button(actions, text="取消", command=self.window.destroy).pack(side="right", padx=6)
-        model = slab.mechanism
         if isinstance(model, ReactionNetwork):
-            for item in model.components:
-                self.add("components", (item.name, item.initial))
-            for r in model.reactions:
-                self.add("reactions", (r.source, r.target, r.prefactor, r.energy, r.yield_pct, r.heat))
+            for key in self.WIDTHS:
+                for record in getattr(model, key):
+                    self.add(key, [getattr(record, f.name) for f in fields(record)])
         else:
             self.add("components")
             self.add("reactions")
 
-    def add(self, key, values=None):
+    def add(self, key, values=()):
         grid = self.grids[key]
         row = grid.grid_size()[1]
-        if values is None:
-            values = ("", "") if key == "components" else ("", "", "", "", "", "")
         widgets = []
-        for col, value in enumerate(values):
-            field = self.ttk.Entry(grid, width=10)
+        for col in range(self.WIDTHS[key]):
+            value = values[col] if col < len(values) else None
+            field = self.ttk.Entry(grid, width=11)
             field.grid(row=row, column=col, sticky="ew", padx=(0, 4), pady=2)
-            field.insert(0, str(value))
+            if value is not None:
+                field.insert(0, str(value))
             widgets.append(field)
         delete = self.ttk.Button(grid, text="删除", width=5, command=lambda: self.remove(key, widgets))
-        delete.grid(row=row, column=len(values), padx=2)
+        delete.grid(row=row, column=len(widgets), padx=2)
         widgets.append(delete)
         self.rows[key].append(widgets)
 
@@ -1301,6 +1607,23 @@ class ReactionTableEditor:
         for widget in widgets:
             widget.destroy()
 
+    def fill_materials(self):
+        try:
+            shared = [float(self.slab.inputs[k].get()) for k in ("density", "heat_capacity", "conductivity", "emissivity")]
+        except ValueError:
+            self.status.set("请先在平板输入有效的公共热物性，或直接在此表填写。")
+            return
+        for row in self.rows["materials"][:]:
+            if all(not field.get().strip() for field in row[:-1]):
+                self.remove("materials", row)
+        present = {row[0].get().strip() for row in self.rows["materials"]}
+        for row in self.rows["components"]:
+            name = row[0].get().strip()
+            if name and name not in present:
+                self.add("materials", (name, *shared))
+                present.add(name)
+        self.status.set("已按组分名称补齐缺少的行。可按材料数据修改各项。")
+
     def paste(self, key):
         try:
             lines = self.window.clipboard_get().splitlines()
@@ -1308,9 +1631,10 @@ class ReactionTableEditor:
             self.status.set("剪贴板中没有文本。")
             return
         rows = [line.split("\t") for line in lines if line.strip()]
-        columns = 2 if key == "components" else 6
-        if not rows or any(len(row) != columns for row in rows):
-            self.status.set(f"复制数据行时请按本表顺序选择 {columns} 列，使用制表符分隔。")
+        lengths = {"components": (2,), "reactions": (6, 8), "materials": (5, 12)}[key]
+        if not rows or any(len(row) not in lengths for row in rows):
+            length_text = " 或 ".join(str(n) for n in lengths)
+            self.status.set(f"请按表头顺序复制 {length_text} 列，使用制表符分隔。")
             return
         for widgets in self.rows[key][:]:
             if all(not field.get().strip() for field in widgets[:-1]):
@@ -1323,18 +1647,28 @@ class ReactionTableEditor:
         records = []
         for index, widgets in enumerate(self.rows[key], 1):
             values = [field.get().strip() for field in widgets[:-1]]
-            try:
-                numbers = [float(value) for value in values[text_columns:]]
-            except ValueError as error:
-                name = "组分" if key == "components" else "反应"
-                raise ValueError(f"{name}第 {index} 行存在空白或无效数字。") from error
+            numbers = []
+            for value, spec in zip(values[text_columns:], fields(cls)[text_columns:]):
+                if not value and spec.default is not MISSING:
+                    numbers.append(spec.default)
+                    continue
+                try:
+                    numbers.append(float(value))
+                except ValueError as error:
+                    name = {"components": "组分", "reactions": "反应", "materials": "热物性"}[key]
+                    raise ValueError(f"{name}第 {index} 行存在空白或无效数字。") from error
             records.append(cls(*values[:text_columns], *numbers))
         return tuple(records)
 
     def apply(self):
         try:
+            try:
+                tr = float(self.reference.get())
+            except ValueError as error:
+                raise ValueError("请输入开尔文参考温度 Tr。") from error
             network = ReactionNetwork(self.read_rows("components", Component, 1),
-                                      self.read_rows("reactions", NetworkReaction, 2))
+                                      self.read_rows("reactions", NetworkReaction, 2),
+                                      self.read_rows("materials", SpeciesThermal, 1), tr)
             network.validate()
         except ValueError as error:
             self.status.set(str(error))
@@ -1509,6 +1843,15 @@ def read_experiment(path, parameters):
     return SlabExperiment(path.name, parameters, tuple(observations))
 
 
+def default_thermal_keys(kinetics):
+    prefix = ""
+    if isinstance(kinetics, ReactionNetwork) and kinetics.materials:
+        dominant = max(kinetics.components, key=lambda component: component.initial).name
+        index = next(i for i, row in enumerate(kinetics.materials) if row.name == dominant)
+        prefix = f"m{index}."
+    return (prefix + "conductivity", prefix + "heat_capacity")
+
+
 def inverse_fields(kinetics):
     fields = [
         ("density", "原材料密度 (kg/m³)", 20, 10000),
@@ -1516,10 +1859,23 @@ def inverse_fields(kinetics):
         ("heat_capacity", "原材料比热 (J/kg·K)", 300, 6000),
     ]
     if isinstance(kinetics, ReactionNetwork):
+        if kinetics.materials:
+            fields = []
+            for i, material in enumerate(kinetics.materials):
+                for key, label, low, high in PROPERTY_FIELDS:
+                    current = getattr(material, key)
+                    fields.append((f"m{i}.{key}", f"{material.name} · {label}",
+                                   min(low, current / 2), max(high, current * 2)))
         for i, reaction in enumerate(kinetics.reactions):
             prefix = f"反应 {i + 1} · {reaction.source} → {reaction.target}"
             fields.extend(((f"{i}.energy", prefix + " · E (kJ/mol)", 0, max(500, reaction.energy * 2)),
                            (f"{i}.log_z", prefix + " · log₁₀Z", -300, 300)))
+            if reaction.heat is None:
+                for key, symbol, active in (("solid_heat", "ΔHsol", reaction.yield_pct > 0),
+                                             ("gas_heat", "ΔHvol", reaction.yield_pct < 100)):
+                    if active:
+                        span = max(2e6, 2 * abs(getattr(reaction, key)))
+                        fields.append((f"{i}.{key}", f"{prefix} · {symbol} (J/kg)", -span, span))
     elif isinstance(kinetics, SlabMechanism):
         for side, name in (("first", "反应 1"), ("second", "反应 2")):
             fields.extend((f"{side}.{key}", f"{name} · {label}", low, high)
@@ -1533,6 +1889,8 @@ def inverse_value(parameters, kinetics, key):
     if "." in key:
         side, field = key.split(".")
         if isinstance(kinetics, ReactionNetwork):
+            if side.startswith("m"):
+                return getattr(kinetics.materials[int(side[1:])], field)
             reaction = kinetics.reactions[int(side)]
             return math.log10(reaction.prefactor) if field == "log_z" else getattr(reaction, field)
         return getattr(getattr(kinetics, side), field)
@@ -1549,13 +1907,18 @@ def with_inverse_values(parameters, kinetics, keys, values):
             changes[key] = selected[key]
     if isinstance(kinetics, ReactionNetwork):
         rows = list(kinetics.reactions)
+        materials = list(kinetics.materials)
         for key, value in selected.items():
             if "." in key:
                 index, field = key.split(".")
+                if index.startswith("m"):
+                    i = int(index[1:])
+                    materials[i] = replace(materials[i], **{field: value})
+                    continue
                 i = int(index)
                 change = {"prefactor": 10 ** value} if field == "log_z" else {field: value}
                 rows[i] = replace(rows[i], **change)
-        kinetics = replace(kinetics, reactions=tuple(rows))
+        kinetics = replace(kinetics, reactions=tuple(rows), materials=tuple(materials))
     elif isinstance(kinetics, SlabMechanism):
         replacements = {}
         for side in ("first", "second"):
@@ -1952,7 +2315,7 @@ class InverseWindow:
             if key.endswith(".log_z"):
                 span = 1.0  # Search one decade either side of the supplied rate factor.
             low, high = max(lo, current - span), min(hi, current + span)
-            enabled = tk.BooleanVar(value=key in ("conductivity", "heat_capacity"))
+            enabled = tk.BooleanVar(value=key in default_thermal_keys(self.kinetics))
             bottom, top = tk.StringVar(value=f"{low:.7g}"), tk.StringVar(value=f"{high:.7g}")
             ttk.Checkbutton(bounds, variable=enabled, text=label).grid(row=row, column=0, sticky="w")
             ttk.Entry(bounds, textvariable=bottom, width=10).grid(row=row, column=1, padx=(0, 6), pady=1)
@@ -2092,9 +2455,12 @@ class InverseWindow:
             samples = []
             for holdout, flux, thickness, duration in ((False, 14, 4, 35), (True, 19, 6, 38)):
                 settings = replace(p, thickness=thickness, flux=flux, duration=duration, cells=8, step=.5)
-                truth = replace(settings, conductivity=min(400, settings.conductivity * 1.19),
-                                heat_capacity=max(300, settings.heat_capacity * .88))
-                forward = slab_simulate(truth, self.kinetics, profiles=False)
+                keys = default_thermal_keys(self.kinetics)
+                bounds = {key: (low, high) for key, _, low, high in inverse_fields(self.kinetics)}
+                values = [min(bounds[k][1], max(bounds[k][0], inverse_value(settings, self.kinetics, k) * factor))
+                          for k, factor in zip(keys, (1.19, .88))]
+                truth, model = with_inverse_values(settings, self.kinetics, keys, values)
+                forward = slab_simulate(truth, model, profiles=False)
                 observations = tuple(Observation(f.time, tuple(getattr(f, attr) for _, _, attr, _ in OBSERVABLES))
                                      for f in forward.frames[::2])
                 samples.append(SlabExperiment("合成留出工况" if holdout else "合成训练工况",
@@ -2404,6 +2770,8 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
     flux = [1000 * p.flux * max(0.0, min(i + 1, exposed_right) - max(i, exposed_left))
             for i in range(nx)]
     ambient = p.ambient + KELVIN
+    mixture = SolidMixture(kinetics, ambient) if network is not None and kinetics.materials else None
+    initial_density = mixture.initial_density if mixture else p.density
     sigma = STEFAN_BOLTZMANN * p.emissivity
     front, back = [ambient] * nx, [ambient] * nx
     temperature = [ambient] * count
@@ -2433,9 +2801,12 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
     def react_half(scale):
         if network is not None:
             for i, t in enumerate(temperature):
-                released, absorbed, consumed = network.advance(i, t, dt / 2)
+                if mixture:
+                    temperature[i], released, consumed, _ = mixture.react(network, i, t, dt / 2, scale)
+                else:
+                    released, absorbed, consumed = network.advance(i, t, dt / 2)
+                    temperature[i] -= absorbed / p.heat_capacity
                 gas[i] += released
-                temperature[i] -= absorbed / p.heat_capacity
                 raw[i] = max(0.0, raw[i] - consumed)
             check_temperature()
             return
@@ -2491,7 +2862,7 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
             return 0.0, 0.0
         dz = dz0 * scale
         phi = pores()
-        ref_density = p.density / scale
+        ref_density = initial_density / scale
         concentration = [m * ref_density / f for m, f in zip(gas, phi)]
         # Superficial diffusive flux = -D_free * phi^(3/2) * grad(pore concentration).
         mobility = [s.diffusivity * f ** 1.5 for f in phi]
@@ -2513,7 +2884,7 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
             residual = tuple(100 * (u + v + w) for u, v, w in zip(raw, mid, char))
         else:
             residual = tuple(100 * sum(mass) for mass in network.mass)
-        c = tuple(g * p.density / (f * scale) for g, f in zip(gas, pores()))
+        c = tuple(g * initial_density / (f * scale) for g, f in zip(gas, pores()))
         return SectionFrame(t, p.thickness * scale, tuple(value - KELVIN for value in temperature),
                             residual, c, sum(residual) / count, 100 * sum(gas) / count,
                             100 * front_out, 100 * back_out)
@@ -2526,8 +2897,14 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
             raise FitCancelled()
         react_half(scale)
         midpoint_scale = stretch()
-        heat_step(midpoint_scale)
+        if mixture:
+            _, faces = material_heat_step(mixture, network.mass, temperature, midpoint_scale, rows, columns,
+                                          dt, dx, dz0, p, flux, front, back)
+        else:
+            heat_step(midpoint_scale)
         react_half(midpoint_scale)
+        if mixture:
+            update_material_surfaces(temperature, faces)
         scale = stretch()
         out_f, out_b = transport(scale)
         front_out += out_f
@@ -2575,7 +2952,7 @@ SLAB_VIEWS = {
 }
 PROFILES = {"profile", "residual_profile"}
 CASE_FORMAT = "pyro-ignition-lab/slab"
-CASE_VERSION = 1
+CASE_VERSION = 2
 
 
 def slab_probe(result, depth):
@@ -2628,15 +3005,26 @@ class SlabCase:
 def save_slab_case(path, case):
     target = Path(path)
     temp_path = None
+    version = 1
     if isinstance(case.kinetics, ReactionNetwork):
         case.kinetics.validate()
-        reactions = {"type": "network", "data": asdict(case.kinetics)}
+        network = asdict(case.kinetics)
+        if (case.kinetics.materials or case.kinetics.reference_temperature != 298.15
+                or any(r.heat is None for r in case.kinetics.reactions)):
+            version = CASE_VERSION
+        else:
+            del network["materials"], network["reference_temperature"]
+        for row in network["reactions"]:
+            for key in ("heat", "solid_heat", "gas_heat"):
+                if row[key] is None:
+                    del row[key]
+        reactions = {"type": "network", "data": network}
     elif isinstance(case.kinetics, SlabMechanism):
         reactions = {"type": "multistep", "data": asdict(case.kinetics)}
     else:
         reactions = {"type": "single", "data": case.kinetics}
     payload = {
-        "format": CASE_FORMAT, "version": CASE_VERSION, "parameters": asdict(case.parameters),
+        "format": CASE_FORMAT, "version": version, "parameters": asdict(case.parameters),
         "kinetics": reactions,
         "result": asdict(case.result) if case.result else None,
         "view": {"probe_depth_mm": case.probe_depth, "plot": case.view, "time_index": case.time_index},
@@ -2733,7 +3121,7 @@ def load_slab_case(path):
     except (UnicodeError, ValueError, RecursionError) as error:
         raise ValueError("无法读取算例 JSON。") from error
     if (not isinstance(data, dict) or data.get("format") != CASE_FORMAT
-            or type(data.get("version")) is not int or data.get("version") != CASE_VERSION):
+            or type(data.get("version")) is not int or data.get("version") not in (1, CASE_VERSION)):
         raise ValueError("算例格式或版本不受支持。")
     parameters = SlabParameters(**checked_case_fields(data.get("parameters"), (v[0] for v in SLAB_FIELDS)))
     validate_slab(parameters)
@@ -2751,15 +3139,21 @@ def load_slab_case(path):
             if not isinstance(rows, list):
                 raise ValueError("组分或反应表格式错误。")
             items = []
+            allowed = {f.name for f in fields(cls)}
+            required = {f.name for f in fields(cls) if f.default is MISSING}
             for row in rows:
-                if not isinstance(row, dict) or set(row) != set(cls.__dataclass_fields__):
+                if not isinstance(row, dict) or not required <= row.keys() <= allowed:
                     raise ValueError("组分或反应行的字段不完整。")
                 if any(not isinstance(row[k], str) for k in strings):
                     raise ValueError("组分名称必须是文本。")
-                items.append(cls(**{k: v if k in strings else checked_case_number(v) for k, v in row.items()}))
+                numeric = {k: checked_case_number(v) for k, v in row.items() if k not in strings
+                           and not (v is None and cls is NetworkReaction and k in ("heat", "solid_heat", "gas_heat"))}
+                items.append(cls(**{k: row[k] for k in strings}, **numeric))
             return tuple(items)
         kinetics = ReactionNetwork(records("components", Component, ("name",)),
-                                   records("reactions", NetworkReaction, ("source", "target")))
+                                   records("reactions", NetworkReaction, ("source", "target")),
+                                   records("materials", SpeciesThermal, ("name",)) if "materials" in source else (),
+                                   checked_case_number(source.get("reference_temperature", 298.15)))
         kinetics.validate()
         component_names = kinetics.names
     elif multi:
@@ -2810,7 +3204,7 @@ SECTION_QUANTITIES = {
 
 SECTION_HELP = """二维截面在惰性气氛中计算宽向 x 与厚向 z 的导热。受热面为 z = 0。正面中央条带输入平板设置的吸收热通量，两面均与环境对流和辐射换热。两侧绝热且封闭。单元中心温度和固体质量随时间输出。
 
-每次运行读取一维平板中当前的样品、传热、反应和时间设置。宽向与厚向网格数在本窗口单独指定。单步和自定义反应表采用固定的参考热容和导热系数，预设两步机制采用组分热物性。反应产生的单一等效挥发物进入当地连通孔隙，再沿两个方向扩散。有效扩散系数为自由气体扩散系数乘以孔隙率的 1.5 次方。开放面取外部挥发物浓度为零，封闭面取零通量。结果计入孔内库存以及两面的净排出量。
+每次运行读取一维平板中当前的样品、传热、反应和时间设置。宽向与厚向网格数在本窗口单独指定。单步模型采用固定的参考热物性，预设两步机制采用组分热物性。自定义反应表沿用一维中填写的组分热物性与分项反应热，热物性表为空时使用平板公共参数。反应产生的单一等效挥发物进入当地连通孔隙，再沿两个方向扩散。有效扩散系数为自由气体扩散系数乘以孔隙率的 1.5 次方。开放面取外部挥发物浓度为零，封闭面取零通量。结果计入孔内库存以及两面的净排出量。
 
 完全转化厚度以初始厚度为 100%。例如 80% 表示缩至 0.8 倍，120% 表示膨胀至 1.2 倍。厚度随原材料平均转化率线性变化，宽度固定，各列同步伸缩。孔隙率则随各单元原材料转化率在两个输入端点间插值。几何伸缩和孔隙率是独立指定的经验关系。模型假设孔隙中的气体以扩散传质，忽略压力驱动流动、气体携热及变形功。
 
@@ -3106,6 +3500,7 @@ class SlabWindow:
         options.grid(row=1, column=0, sticky="nsw", padx=(0, 9))
         defaults = SlabParameters()
         groups = {0: "样品与热物性", 4: "边界条件", 9: "时间与网格"}
+        self.shared_entries = {}
         row = 0
         for index, (name, label, unit, _, _) in enumerate(SLAB_FIELDS):
             if index in groups:
@@ -3115,7 +3510,10 @@ class SlabWindow:
             variable = tk.StringVar(value=f"{getattr(defaults, name):g}")
             self.inputs[name] = variable
             lab.text(options, label, size=9).grid(row=row, column=0, sticky="w", padx=(0, 5))
-            ttk.Entry(options, textvariable=variable, width=7, justify="right").grid(row=row, column=1, pady=1)
+            entry = ttk.Entry(options, textvariable=variable, width=7, justify="right")
+            entry.grid(row=row, column=1, pady=1)
+            if name in ("density", "heat_capacity", "conductivity", "emissivity"):
+                self.shared_entries[name] = entry
             lab.text(options, unit, fg=MUTED, size=9).grid(row=row, column=2, sticky="w", padx=(4, 0))
             row += 1
         self.kinetics_label = tk.StringVar()
@@ -3228,9 +3626,13 @@ class SlabWindow:
         return tuple(float(self.lab.inputs[key].get()) for key in FIT_KEYS)
 
     def refresh_label(self):
+        material_mode = isinstance(self.mechanism, ReactionNetwork) and bool(self.mechanism.materials)
+        for entry in self.shared_entries.values():
+            entry.configure(state="disabled" if material_mode else "normal")
         if isinstance(self.mechanism, ReactionNetwork):
+            thermal = f"组分热物性 · Tr {self.mechanism.reference_temperature:g} K" if material_mode else "共用平板热物性"
             self.kinetics_label.set(f"自定义模型 · {len(self.mechanism.components)} 种组分"
-                                    f" · {len(self.mechanism.reactions)} 条反应 · 共用平板热物性")
+                                    f" · {len(self.mechanism.reactions)} 条反应 · {thermal}")
             return
         if self.mechanism is not None:
             mode = "两步并联" if self.mechanism.mode == "parallel" else "两步串联"
@@ -3251,11 +3653,16 @@ class SlabWindow:
 
     def parameter_snapshot(self):
         values = {}
-        for name, label, _, _, _ in SLAB_FIELDS:
+        material_mode = isinstance(self.mechanism, ReactionNetwork) and bool(self.mechanism.materials)
+        for name, label, _, low, high in SLAB_FIELDS:
             try:
                 values[name] = float(self.inputs[name].get())
             except ValueError as error:
-                raise ValueError(f"{label}请输入数字。") from error
+                if not (material_mode and name in self.shared_entries):
+                    raise ValueError(f"{label}请输入数字。") from error
+                values[name] = getattr(SlabParameters(), name)
+            if material_mode and name in self.shared_entries and not low <= values[name] <= high:
+                values[name] = getattr(SlabParameters(), name)
         parameters = SlabParameters(**values)
         validate_slab(parameters)
         return parameters
@@ -3320,7 +3727,9 @@ class SlabWindow:
             if item[0] == "done":
                 _, result, self.solved_settings = item
                 self.show_result(result, len(result.frames) - 1)
-                mode = "随组分更新热物性" if isinstance(self.solved_settings[1], SlabMechanism) else "固定热物性"
+                model = self.solved_settings[1]
+                variable = isinstance(model, SlabMechanism) or (isinstance(model, ReactionNetwork) and model.materials)
+                mode = "随组分更新热物性" if variable else "固定热物性"
                 self.status.set(f"计算完成 · 惰性气氛 · 固定厚度 · {mode}")
                 if self.dirty:
                     self.status.set("已显示上次输入的结果，运行模拟以更新修改后的参数。")

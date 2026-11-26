@@ -1,0 +1,119 @@
+{
+  "format": "pyro-ignition-lab/slab",
+  "version": 2,
+  "parameters": {
+    "thickness": 4,
+    "density": 550.0,
+    "conductivity": 0.19,
+    "heat_capacity": 1550.0,
+    "flux": 12,
+    "front_h": 10.0,
+    "back_h": 18.0,
+    "emissivity": 0.85,
+    "ambient": 25.0,
+    "duration": 45,
+    "cells": 16,
+    "step": 0.25
+  },
+  "kinetics": {
+    "type": "network",
+    "data": {
+      "components": [
+        {
+          "name": "matrix",
+          "initial": 0.7
+        },
+        {
+          "name": "binder",
+          "initial": 0.3
+        },
+        {
+          "name": "residue",
+          "initial": 0
+        }
+      ],
+      "reactions": [
+        {
+          "source": "matrix",
+          "target": "residue",
+          "prefactor": 20000.0,
+          "energy": 42,
+          "yield_pct": 30,
+          "solid_heat": -20000,
+          "gas_heat": 100000
+        },
+        {
+          "source": "binder",
+          "target": "gases",
+          "prefactor": 300000.0,
+          "energy": 50,
+          "yield_pct": 0,
+          "solid_heat": 0,
+          "gas_heat": 90000
+        }
+      ],
+      "materials": [
+        {
+          "name": "matrix",
+          "density": 800,
+          "heat_capacity": 1450,
+          "conductivity": 0.22,
+          "emissivity": 0.82,
+          "density_exponent": -0.12,
+          "capacity_exponent": 0.35,
+          "conductivity_exponent": 0.25,
+          "pore_length": 0.0,
+          "melt_heat": 0.0,
+          "melt_temperature": 300.0,
+          "melt_variance": 1.0
+        },
+        {
+          "name": "binder",
+          "density": 920,
+          "heat_capacity": 1750,
+          "conductivity": 0.17,
+          "emissivity": 0.76,
+          "density_exponent": 0.0,
+          "capacity_exponent": 0.2,
+          "conductivity_exponent": 0.0,
+          "pore_length": 0.0,
+          "melt_heat": 65000,
+          "melt_temperature": 322,
+          "melt_variance": 36
+        },
+        {
+          "name": "residue",
+          "density": 420,
+          "heat_capacity": 1050,
+          "conductivity": 0.14,
+          "emissivity": 0.9,
+          "density_exponent": 0.0,
+          "capacity_exponent": 0.0,
+          "conductivity_exponent": 0.1,
+          "pore_length": 0.0008,
+          "melt_heat": 0.0,
+          "melt_temperature": 300.0,
+          "melt_variance": 1.0
+        }
+      ],
+      "reference_temperature": 298.15
+    }
+  },
+  "result": null,
+  "view": {
+    "probe_depth_mm": 1.0,
+    "plot": "temperature",
+    "time_index": 0
+  },
+  "section": {
+    "width": 30.0,
+    "nx": 8,
+    "nz": 16,
+    "heated": 100,
+    "end_thickness": 100,
+    "porosity_raw": 30.0,
+    "porosity_end": 60.0,
+    "diffusivity": 2e-06,
+    "vent": "front"
+  }
+}
