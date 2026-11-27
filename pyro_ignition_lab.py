@@ -741,6 +741,17 @@ SLAB_FIELDS = (
 )
 
 STEFAN_BOLTZMANN = 5.670374419e-8
+DEFAULT_GAS_DIFFUSIVITY = 2e-6  # free diffusivity, m²/s
+
+
+@dataclass(frozen=True)
+class GasBalance:
+    # All quantities in percent of the initial dry solid mass; outward flux is positive.
+    produced: float
+    consumed: float
+    pore: float
+    front: float
+    back: float
 
 
 @dataclass(frozen=True)
@@ -753,6 +764,7 @@ class SlabFrame:
     remaining_mass: float   # % of initial sample mass
     loss_rate: float       # g/(m² s), step average
     composition: tuple[float, ...] = ()  # condensed components followed by generated gas (% initial)
+    gas_balance: tuple[GasBalance, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -763,6 +775,7 @@ class SlabResult:
     mass_error: float
     energy_error: float
     component_names: tuple[str, ...] = ()  # named condensed species; gas is the final composition column
+    gas_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1041,6 +1054,7 @@ class NetworkReaction:
     order: float = 1.0
     catalyst_strength: float = 0.0
     catalyst: str = ""               # condensed component whose conversion modifies model 9
+    gas_yields: tuple[float, ...] = ()  # kg gas species / kg net volatilized
 
     def absorbed_per_kg(self):
         if self.heat is not None:
@@ -1058,15 +1072,30 @@ class NetworkReaction:
 
 
 @dataclass(frozen=True)
+class GasSpecies:
+    name: str
+    diffusivity: float | None = None  # m²/s; None uses the model's shared value
+    initial_concentration: float = 0.0  # kg/m³ of connected pore volume
+    ambient_concentration: float = 0.0  # same units at an open face
+
+
+@dataclass(frozen=True)
 class ReactionNetwork:
     components: tuple[Component, ...]
     reactions: tuple[NetworkReaction, ...]
     materials: tuple[SpeciesThermal, ...] = ()
     reference_temperature: float = 298.15    # K, for species property correlations
+    gas_species: tuple[GasSpecies, ...] = ()
+    slab_porosity: float = 30.0  # fixed connected pore volume in 1D, %
+    slab_vent: str = "front"    # 2D uses SectionParameters instead
 
     @property
     def names(self):
         return tuple(item.name for item in self.components)
+
+    @property
+    def gas_names(self):
+        return tuple(g.name for g in self.gas_species)
 
     def validate(self):
         if not self.components or not self.reactions:
@@ -1090,6 +1119,18 @@ class ReactionNetwork:
                 raise ValueError("热物性表须为每种凝聚相组分填写且只填写一行，包括初始质量为 0 的产物。")
             for material in self.materials:
                 material.validate()
+        gas_names = set()
+        for g in self.gas_species:
+            if (not isinstance(g.name, str) or not g.name or not g.name.isprintable() or g.name != g.name.strip()
+                    or g.name.casefold() == "gases" or g.name in gas_names or g.name in seen):
+                raise ValueError("气体名称须唯一，并与凝聚相名称、保留名 gases 区分。")
+            gas_names.add(g.name)
+            if g.diffusivity is not None and (not math.isfinite(g.diffusivity) or g.diffusivity < 0):
+                raise ValueError(f"{g.name} 的扩散系数须为有限非负数。")
+            if any(not math.isfinite(v) or v < 0 for v in (g.initial_concentration, g.ambient_concentration)):
+                raise ValueError(f"{g.name} 的初始和外界浓度须为有限非负数。")
+        if not 0 < self.slab_porosity <= 100 or not isinstance(self.slab_vent, str) or self.slab_vent not in VENTS:
+            raise ValueError("一维连通孔隙率须大于 0 且不超过 100%，并选择有效的排气边界。")
         for i, r in enumerate(self.reactions, 1):
             if r.source not in seen or (r.target != "gases" and r.target not in seen):
                 raise ValueError(f"反应第 {i} 行 From 或 To 名称未在组分表定义。")
@@ -1116,16 +1157,44 @@ class ReactionNetwork:
                 raise ValueError(f"反应第 {i} 行：{error}") from error
             if r.target == "gases" and r.yield_pct != 0:
                 raise ValueError(f"反应第 {i} 行产物为 gases，凝聚相产率应为 0%。")
+            if not self.gas_species and r.gas_yields:
+                raise ValueError(f"反应第 {i} 行含气体产率，请先定义气体组分。")
+            if self.gas_species:
+                if len(r.gas_yields) != len(self.gas_species) or not all(map(math.isfinite, r.gas_yields)):
+                    raise ValueError(f"反应第 {i} 行的气体产率须与气体组分一一对应，并填写有限数值。")
+                if r.yield_pct == 100:
+                    if any(r.gas_yields):
+                        raise ValueError(f"反应第 {i} 行无净挥发量，各气体产率应为 0。")
+                else:
+                    try:
+                        total_yield = math.fsum(r.gas_yields)
+                    except OverflowError as error:
+                        raise ValueError(f"反应第 {i} 行气体产率超过数值范围。") from error
+                    if not math.isclose(total_yield, 1.0, rel_tol=0.0, abs_tol=1e-9):
+                        raise ValueError(f"反应第 {i} 行各气体产率的代数和应为 1。")
+
+
+@dataclass(frozen=True)
+class ReactionChannel:
+    target: int | None
+    prefactor: float
+    activation: float   # E / R, K
+    retained: float
+    enthalpy: float
+    catalyst: int | None
+    strength: float
+    gas_yields: tuple[float, ...]
 
 
 class ReactionGrid:
     """Per-cell inventory and competitive condensed-phase reaction extents."""
-    def __init__(self, network, count):
+    def __init__(self, network, count, *, density=None, pore_fraction=None, diffusivity=DEFAULT_GAS_DIFFUSIVITY):
         network.validate()
         indices = {name: i for i, name in enumerate(network.names)}
         groups = {}
         history = False
         self.catalytic = False
+        self.needs_gas = False
         for r in network.reactions:
             source = indices[r.source]
             model = 0 if r.kinetic_model in (2, 9) else r.kinetic_model
@@ -1136,9 +1205,15 @@ class ReactionGrid:
                 model, order = 0, 0
             history |= (model, order) != (0, 1) or bool(r.catalyst_strength)
             self.catalytic |= bool(r.catalyst_strength)
+            self.needs_gas |= any(y < 0 for y in r.gas_yields)
             channels = groups.setdefault(source, {}).setdefault((model, order), [])
-            channels.append((indices.get(r.target), r.prefactor, r.energy * (1000 / R),
-                             r.yield_pct / 100, r.absorbed_per_kg(), indices.get(r.catalyst), r.catalyst_strength))
+            yields = r.gas_yields
+            if any(yields):
+                total = math.fsum(yields)
+                yields = tuple(y / total for y in yields)
+            channels.append(ReactionChannel(indices.get(r.target), r.prefactor, r.energy * (1000 / R),
+                                            r.yield_pct / 100, r.absorbed_per_kg(), indices.get(r.catalyst),
+                                            r.catalyst_strength, yields))
         self.groups = [(source, sorted(shapes.items())) for source, shapes in groups.items()]
         total = math.fsum(item.initial for item in network.components)
         initial = [item.initial / total for item in network.components]
@@ -1146,6 +1221,14 @@ class ReactionGrid:
         self.virgin = [initial.copy() for _ in range(count)]
         # Available + ever consumed = initial stock + cumulative production, even for cycles.
         self.spent = [[0.0] * len(initial) for _ in range(count)] if history else None
+        self.gases = None
+        if network.gas_species:
+            if density is None:
+                density = (SolidMixture(network, ROOM + KELVIN).initial_density
+                           if network.materials else SlabParameters().density)
+            if pore_fraction is None:
+                pore_fraction = network.slab_porosity / 100
+            self.gases = PoreGasGrid(network.gas_species, count, density, pore_fraction, diffusivity)
 
     def advance(self, cell, temperature, dt):
         mass, virgin = self.mass[cell], self.virgin[cell]
@@ -1153,8 +1236,7 @@ class ReactionGrid:
         conversions = ()
         if self.catalytic:
             conversions = tuple(d / (m + d) if m + d else 0.0 for m, d in zip(mass, spent))
-        produced = [0.0] * len(mass)
-        gas = heat = original_consumed = 0.0
+        proposals = []
         for source, groups in self.groups:
             stock = mass[source]
             if not stock:
@@ -1166,10 +1248,10 @@ class ReactionGrid:
             shapes, channels = [], []
             for (model, order), edges in groups:
                 rates = []
-                for _, z, activation, _, _, catalyst, strength in edges:
-                    rate = z * math.exp(-activation / temperature)
-                    if strength:
-                        rate *= 1 + strength * conversions[catalyst]
+                for edge in edges:
+                    rate = edge.prefactor * math.exp(-edge.activation / temperature)
+                    if edge.strength:
+                        rate *= 1 + edge.strength * conversions[edge.catalyst]
                     rates.append(rate)
                 rate = math.fsum(rates)
                 if rate:
@@ -1183,27 +1265,43 @@ class ReactionGrid:
             else:
                 fractions = mixed_fractions(shapes, alpha, remaining, dt)
             total_fraction = math.fsum(fractions)
-            fraction = min(1.0, total_fraction)
-            if not fraction:
+            if not total_fraction:
                 continue
-            consumed = stock * fraction
-            mass[source] -= consumed
-            if spent is not None:
-                spent[source] += consumed
-            original = virgin[source] * fraction
-            virgin[source] -= original
-            original_consumed += original
+            consumed = stock * min(1.0, total_fraction)
             for share, (_, _, rate), (edges, rates) in zip(fractions, shapes, channels):
                 path_mass = consumed * (share / total_fraction)
-                for (target, _, _, retained, enthalpy, _, _), k in zip(edges, rates):
-                    amount = path_mass * (k / rate)
-                    if target is not None:
-                        produced[target] += amount * retained
-                    gas += amount * (1 - retained)
-                    heat += amount * enthalpy
-        # Products enter the following half-step; all sources see the same catalyst snapshot.
-        for i, value in enumerate(produced):
-            mass[i] += value
+                proposals.extend((source, edge, path_mass * (k / rate)) for edge, k in zip(edges, rates))
+
+        # All channels see the same initial stocks, including gas-consuming channels.
+        limits = self.gases.available_fractions(cell, proposals) if self.needs_gas else ()
+        used_solid, formed_solid = [0.0] * len(mass), [0.0] * len(mass)
+        made = [0.0] * len(self.gases.mass) if self.gases else []
+        used = [0.0] * len(made)
+        gas = heat = original_consumed = 0.0
+        for source, edge, amount in proposals:
+            if limits:
+                amount *= min((limits[j] for j, y in enumerate(edge.gas_yields) if y < 0), default=1.0)
+            used_solid[source] += amount
+            if edge.target is not None:
+                formed_solid[edge.target] += amount * edge.retained
+            volatilized = amount * (1 - edge.retained)
+            gas += volatilized
+            heat += amount * edge.enthalpy
+            for j, y in enumerate(edge.gas_yields):
+                if y < 0:
+                    used[j] -= volatilized * y
+                else:
+                    made[j] += volatilized * y
+        for i, consumed in enumerate(used_solid):
+            if consumed:
+                original = virgin[i] * min(1.0, consumed / mass[i])
+                virgin[i] -= original
+                original_consumed += original
+                if spent is not None:
+                    spent[i] += consumed
+            mass[i] = max(0.0, mass[i] - consumed) + formed_solid[i]
+        if self.gases:
+            self.gases.record(cell, made, used)
         return gas, heat, original_consumed
 
 
@@ -1536,8 +1634,10 @@ def slab_simulate_materials(p, model, cancelled, profiles):
     dt = p.duration / steps
     dz = p.thickness / (1000 * count)
     ambient = p.ambient + KELVIN
-    grid = ReactionGrid(model, count)
+    model.validate()
     mixture = SolidMixture(model, ambient)
+    grid = ReactionGrid(model, count, density=mixture.initial_density)
+    balances = grid.gases.balances() if grid.gases else ()
     cell_mass = mixture.initial_density * dz
     depths = (0.0, *(p.thickness * (i + .5) / count for i in range(count)), p.thickness)
     temperature = [ambient] * count
@@ -1559,7 +1659,7 @@ def slab_simulate_materials(p, model, cancelled, profiles):
         values = (front[0] - KELVIN, *(t - KELVIN for t in temperature), back[0] - KELVIN) if profiles else ()
         residue = tuple(100 * sum(m) for m in grid.mass) if profiles else ()
         return SlabFrame(time, front[0] - KELVIN, back[0] - KELVIN, values, residue, sum(solids),
-                         rate, (*solids, 100 * generated / count))
+                         rate, (*solids, 100 * generated / count), balances)
 
     frames = [frame(0, 0)]
     for index in range(1, steps + 1):
@@ -1573,11 +1673,16 @@ def slab_simulate_materials(p, model, cancelled, profiles):
         generated += gas1 + gas2
         rate = (gas1 + gas2) * cell_mass * 1000 / dt
         peak = max(peak, rate)
-        mass_error = max(mass_error, abs((sum(map(sum, grid.mass)) + generated) / count - 1))
+        solid = sum(map(sum, grid.mass)) / count
+        mass_error = max(mass_error, abs(solid + generated / count - 1))
+        if grid.gases:
+            grid.gases.transport_slab(dt, dz, model.slab_vent)
+            balances = grid.gases.balances()
+            mass_error = max(mass_error, grid.gases.error(balances, solid))
         energy_error = max(energy_error, abs(error1 + error_t + error2) * dz)
         if index % sample_every == 0 or index == steps:
             frames.append(frame(index * dt, rate))
-    return SlabResult(depths, tuple(frames), peak, mass_error, energy_error, model.names)
+    return SlabResult(depths, tuple(frames), peak, mass_error, energy_error, model.names, model.gas_names)
 
 
 def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=True):
@@ -1613,7 +1718,9 @@ def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=Tru
     front = back = ambient
     peak_loss = vented = sum_reaction_heat = sum_boundary_heat = 0.0
     max_mass_error = max_energy_error = 0.0
-    network = ReactionGrid(kinetics, count) if isinstance(kinetics, ReactionNetwork) else None
+    network = ReactionGrid(kinetics, count, density=p.density) if isinstance(kinetics, ReactionNetwork) else None
+    pore = network.gases if network else None
+    balances = pore.balances() if pore else ()
     single = kinetics is not None and network is None
     energy, log_prefactor, yield_percent = kinetics if single else (0.0, 0.0, 0.0)
     if single:
@@ -1661,7 +1768,7 @@ def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=Tru
                            100 * vented / initial_mass)
         return SlabFrame(time, front - KELVIN, back - KELVIN,
                          (front - KELVIN, *(value - KELVIN for value in temperatures), back - KELVIN) if profiles else (),
-                         residual if profiles else (), sum(residual) / count, loss_rate, composition)
+                         residual if profiles else (), sum(residual) / count, loss_rate, composition, balances)
 
     frames = [frame(0, 0)]
     for step in range(1, steps + 1):
@@ -1698,13 +1805,28 @@ def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=Tru
         else:
             remaining = sum(map(sum, network.mass)) * p.density * dx
         max_mass_error = max(max_mass_error, abs(remaining + vented - initial_mass) / initial_mass)
+        if pore:
+            pore.transport_slab(dt, dx, kinetics.slab_vent)
+            balances = pore.balances()
+            max_mass_error = max(max_mass_error, pore.error(balances, remaining / initial_mass))
         sensible = capacity * sum(temp - ambient for temp in temperatures)
         max_energy_error = max(max_energy_error, abs(sensible + sum_reaction_heat - sum_boundary_heat))
         if step % sample_every == 0 or step == steps:
             frames.append(frame(step * dt, loss_rate))
 
     return SlabResult(depth, tuple(frames), peak_loss, max_mass_error, max_energy_error,
-                      kinetics.names if network is not None else ())
+                      kinetics.names if network is not None else (), kinetics.gas_names if pore else ())
+
+
+GAS_CSV_FIELDS = ("produced", "consumed", "pore", "front_net_out", "back_net_out")
+
+
+def gas_csv_headers(names):
+    return [f"gas_{name}_{field}_pct_initial" for name in names for field in GAS_CSV_FIELDS]
+
+
+def gas_csv_values(balances):
+    return [v for b in balances for v in (b.produced, b.consumed, b.pore, b.front, b.back)]
 
 
 def export_slab(path, result):
@@ -1717,10 +1839,11 @@ def export_slab(path, result):
             composition_columns.append("released_volatile_pct")
         writer.writerow(["time_s", "front_C", "back_C", "remaining_mass_pct", "mass_loss_g_m2_s"] +
                         [f"T_C_at_z_{depth:.6f}_mm" for depth in result.depth_mm[1:-1]] +
-                        [f"solid_mass_pct_at_z_{depth:.6f}_mm" for depth in result.depth_mm[1:-1]] + composition_columns)
+                        [f"solid_mass_pct_at_z_{depth:.6f}_mm" for depth in result.depth_mm[1:-1]] +
+                        composition_columns + gas_csv_headers(result.gas_names))
         for frame in result.frames:
             values = (frame.time, frame.front, frame.back, frame.remaining_mass, frame.loss_rate,
-                      *frame.temperature[1:-1], *frame.residual, *frame.composition)
+                      *frame.temperature[1:-1], *frame.residual, *frame.composition, *gas_csv_values(frame.gas_balance))
             writer.writerow([f"{value:.7f}" for value in values])
 
 
@@ -1729,7 +1852,9 @@ SLAB_HELP = """一维平板 · 惰性气氛
 
 「组分与反应表」可设置各凝聚相组分的初始质量分数。每条反应可选择动力学模型 0–9，并为适用的模型填写级数 n。点击「定位动力学列」可跳到这些输入框，「模型公式」可查看各编号对应的速率函数。局部转化率等于该组分累计消耗量除以其初始量与累计生成量之和。To 为凝聚相时其产率按消耗质量的百分比填写，余量归入 gases。有效热按消耗量计（kJ/kg）。用分项热时，ΔHsol 和 ΔHvol 分别按生成的凝聚相产物、挥发物质量计（J/kg），正值吸热。
 
-「组分热物性」可逐行设置参考密度、比热、导热和发射率，各组分使用同一个开尔文参考温度。可选温度幂指数、孔隙辐射导热和熔化吸热峰。比热按质量加权，导热和表面发射率按组分体积加权。表为空时共用平板热物性。在整体组分视图中可选组分或累计生成的 gases。
+「组分热物性」可逐行设置参考密度、比热、导热和发射率，各组分使用同一个开尔文参考温度。可选温度幂指数、孔隙辐射导热和熔化吸热峰。比热按质量加权，导热和表面发射率按组分体积加权。表为空时共用平板热物性。在整体组分视图中可选组分或凝聚相的累计净挥发量 gases。
+
+「气体组分」填写每种气体的扩散系数、初始孔内浓度与开放面外界浓度。「气体产率矩阵」每行对应一条反应，每列对应一种气体，数值按每 kg 净挥发量计。正数为生成，负数为消耗。局部缺少所需气体时，反应消耗的固体、生成的各产物和反应热同步减少。点击「气体质量收支」并选择气体，可查看累计生成、累计消耗、当前孔内质量和两面的累计净排出。各量均以初始干样质量为 100%，正通量流出，负通量流入。一维使用固定的连通孔隙率。
 
 单步模式使用主窗口的热解参数和固定热物性。两步模式在「多步反应与材料」中选择并联或串联，各步独立设置动力学、固体产率和吸热量。中间产物与残炭可配置密度、比热和导热系数，原材料热物性取自平板左栏。
 
@@ -1748,7 +1873,7 @@ class ReactionTableEditor:
     """Edit the material model as a draft; apply all validated tables together."""
     THERMAL_LABELS = ("组分名称", "ρ₀ (kg/m³)", "c₀ (J/kg/K)", "k₀ (W/m/K)", "ε", "nρ", "nc", "nk",
                       "γ (m)", "ΔHm (J/kg)", "Tm (K)", "σm² (K²)")
-    WIDTHS = {"components": 2, "reactions": 12, "materials": len(THERMAL_LABELS)}
+    WIDTHS = {"components": 2, "reactions": 12, "materials": len(THERMAL_LABELS), "gas_species": 4}
     MODEL_CHOICES = tuple(f"{i} · {name}" for i, name in enumerate(KINETIC_MODELS))
 
     def __init__(self, slab):
@@ -1767,6 +1892,10 @@ class ReactionTableEditor:
         self.grids = {}
         model = slab.mechanism
         self.reference = tk.StringVar(value=str(model.reference_temperature if isinstance(model, ReactionNetwork) else 298.15))
+        self.porosity = tk.StringVar(value=str(model.slab_porosity if isinstance(model, ReactionNetwork) else 30))
+        self.gas_vent = tk.StringVar(value=VENTS[model.slab_vent if isinstance(model, ReactionNetwork) else "front"])
+        self.yield_vars = {}
+        self.matrix_signature = None
         for key, title, hint, labels in (
             ("components", "组分与初始质量分数",
              "每行一个凝聚相组分。质量分数填 0–1，总和须为 1。只作为产物出现的组分填 0。",
@@ -1780,6 +1909,9 @@ class ReactionTableEditor:
              "按组分补齐可从当前平板参数开始。填前 5 列即可用常物性，右侧可填温度指数、孔隙辐射长度和熔化峰。"
              "熔化峰宽输入方差 σm²（K²）。热物性表无数据时沿用平板公共参数。",
              self.THERMAL_LABELS),
+            ("gas_species", "气体组分",
+             "每行一种气体。初始浓度和开放面外界浓度按孔隙体积填写，留空为 0。D 留空时一维用 2×10⁻⁶ m²/s，二维用截面设置的扩散系数。",
+             ("气体名称", "D (m²/s)", "初始浓度 (kg/m³)", "外界浓度 (kg/m³)")),
         ):
             panel = ttk.Frame(self.tabs, padding=8)
             self.tabs.add(panel, text=title)
@@ -1792,31 +1924,26 @@ class ReactionTableEditor:
                 ttk.Button(actions, text="按组分补齐", command=self.fill_materials).pack(side="left")
                 ttk.Label(actions, text="参考温度 Tr (K)").pack(side="left", padx=(14, 4))
                 ttk.Entry(actions, width=9, textvariable=self.reference).pack(side="left")
-            area = ttk.Frame(panel)
-            area.pack(fill="both", expand=True)
-            area.columnconfigure(0, weight=1)
-            area.rowconfigure(0, weight=1)
-            canvas = tk.Canvas(area, bg=BG, highlightthickness=0)
-            scroll_y = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
-            scroll_x = ttk.Scrollbar(area, orient="horizontal", command=canvas.xview)
-            scroll_y.grid(row=0, column=1, sticky="ns")
-            scroll_x.grid(row=1, column=0, sticky="ew")
-            canvas.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
-            canvas.grid(row=0, column=0, sticky="nsew")
+            if key == "gas_species":
+                ttk.Label(actions, text="一维连通孔隙率 (%)").pack(side="left", padx=(12, 4))
+                ttk.Entry(actions, width=6, textvariable=self.porosity).pack(side="left")
+                ttk.Combobox(actions, values=tuple(VENTS.values()), state="readonly", width=9,
+                             textvariable=self.gas_vent).pack(side="left", padx=6)
+            grid, canvas = self.scroll_grid(panel)
             if key == "reactions":
                 ttk.Button(actions, text="定位动力学列", command=lambda c=canvas: c.xview_moveto(1)).pack(side="left")
                 ttk.Button(actions, text="模型公式", command=self.show_laws).pack(side="left", padx=6)
-            grid = ttk.Frame(canvas)
-            item = canvas.create_window(0, 0, anchor="nw", window=grid)
-            def resize(_, c=canvas, g=grid, item=item):
-                c.itemconfigure(item, width=max(c.winfo_width(), g.winfo_reqwidth()))
-                c.configure(scrollregion=c.bbox("all"))
-            grid.bind("<Configure>", resize)
-            canvas.bind("<Configure>", resize)
             for col, label in enumerate(labels):
                 grid.columnconfigure(col, weight=1)
                 ttk.Label(grid, text=label).grid(row=0, column=col, sticky="w")
             self.grids[key] = grid
+        self.matrix_panel = ttk.Frame(self.tabs, padding=8)
+        self.tabs.add(self.matrix_panel, text="气体产率矩阵")
+        slab.lab.text(self.matrix_panel, "每列一种气体。每格填 kg 气体 / kg 净挥发量。正数为生成，负数为消耗，空格计 0。"
+                      "有净挥发量的反应每行合计为 1，凝聚相产率 100% 时全为 0。",
+                      bg=BG, fg=MUTED, wraplength=680, justify="left").pack(anchor="w")
+        ttk.Button(self.matrix_panel, text="粘贴矩阵", command=self.paste_matrix).pack(anchor="w", pady=5)
+        self.matrix_grid, _ = self.scroll_grid(self.matrix_panel)
         self.status = tk.StringVar(value="填写后点击「应用到平板」。可从电子表格复制与表头同序的数据行。")
         slab.lab.text(body, value=self.status, bg=BG, fg=MUTED, wraplength=680).pack(anchor="w", pady=6)
         actions = ttk.Frame(body)
@@ -1830,6 +1957,79 @@ class ReactionTableEditor:
         else:
             self.add("components")
             self.add("reactions")
+        self.refresh_matrix()
+        if isinstance(model, ReactionNetwork):
+            for row, reaction in zip(self.rows["reactions"], model.reactions):
+                for col, value in zip(self.rows["gas_species"], reaction.gas_yields):
+                    self.yield_vars[row[0], col[0]].set(str(value))
+        self.tabs.bind("<<NotebookTabChanged>>", self.table_changed)
+
+    def scroll_grid(self, panel):
+        tk, ttk = self.tk, self.ttk
+        area = ttk.Frame(panel)
+        area.pack(fill="both", expand=True)
+        area.columnconfigure(0, weight=1)
+        area.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(area, bg=BG, highlightthickness=0)
+        scroll_y = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
+        scroll_x = ttk.Scrollbar(area, orient="horizontal", command=canvas.xview)
+        scroll_y.grid(row=0, column=1, sticky="ns")
+        scroll_x.grid(row=1, column=0, sticky="ew")
+        canvas.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        grid = ttk.Frame(canvas)
+        item = canvas.create_window(0, 0, anchor="nw", window=grid)
+        def resize(_):
+            canvas.itemconfigure(item, width=max(canvas.winfo_width(), grid.winfo_reqwidth()))
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        grid.bind("<Configure>", resize)
+        canvas.bind("<Configure>", resize)
+        return grid, canvas
+
+    def table_changed(self, _event):
+        if self.tabs.select() == str(self.matrix_panel):
+            self.refresh_matrix()
+
+    def refresh_matrix(self):
+        reactions, gases = self.rows["reactions"], self.rows["gas_species"]
+        signature = (tuple((r[0], r[0].get(), r[1].get()) for r in reactions),
+                     tuple((g[0], g[0].get()) for g in gases))
+        if signature == self.matrix_signature:
+            return
+        self.matrix_signature = signature
+        grid = self.matrix_grid
+        for w in grid.winfo_children():
+            w.destroy()
+        previous, self.yield_vars = self.yield_vars, {}
+        if not gases or not reactions:
+            self.ttk.Label(grid, text="先在「From → To 反应」和「气体组分」各添加至少一行。").grid(sticky="w")
+            return
+        self.ttk.Label(grid, text="反应").grid(row=0, column=0, sticky="w", padx=4)
+        for j, g in enumerate(gases, 1):
+            self.ttk.Label(grid, text=g[0].get().strip() or f"气体 {j}").grid(row=0, column=j, sticky="w", padx=4)
+        for i, r in enumerate(reactions, 1):
+            label = f"{i}. {r[0].get().strip() or 'From'} → {r[1].get().strip() or 'To'}"
+            self.ttk.Label(grid, text=label).grid(row=i, column=0, sticky="w", padx=4)
+            for j, g in enumerate(gases, 1):
+                key = (r[0], g[0])
+                var = previous[key] if key in previous else self.tk.StringVar(master=grid)
+                self.yield_vars[key] = var
+                self.ttk.Entry(grid, textvariable=var, width=15).grid(row=i, column=j, sticky="ew", padx=4, pady=2)
+
+    def paste_matrix(self):
+        self.refresh_matrix()
+        reactions, gases = self.rows["reactions"], self.rows["gas_species"]
+        try:
+            rows = [line.split("\t") for line in self.window.clipboard_get().splitlines()]
+        except self.tk.TclError:
+            rows = []
+        if not gases or not reactions or len(rows) != len(reactions) or any(len(row) != len(gases) for row in rows):
+            self.status.set(f"请复制 {len(reactions)} 行 × {len(gases)} 列产率数值，省略表头与反应名称。")
+            return
+        for r, values in zip(reactions, rows):
+            for g, value in zip(gases, values):
+                self.yield_vars[r[0], g[0]].set(value.strip())
+        self.status.set("已粘贴气体产率矩阵。")
 
     def add(self, key, values=()):
         grid = self.grids[key]
@@ -1901,7 +2101,7 @@ class ReactionTableEditor:
             self.status.set("剪贴板中没有文本。")
             return
         rows = [line.split("\t") for line in lines if line.strip()]
-        lengths = {"components": (2,), "reactions": (6, 8, 10, 12), "materials": (5, 12)}[key]
+        lengths = {"components": (2,), "reactions": (6, 8, 10, 12), "materials": (5, 12), "gas_species": (1, 2, 3, 4)}[key]
         if not rows or any(len(row) not in lengths for row in rows):
             length_text = " 或 ".join(str(n) for n in lengths)
             self.status.set(f"请按表头顺序复制 {length_text} 列，使用制表符分隔。")
@@ -1933,7 +2133,7 @@ class ReactionTableEditor:
                     else:
                         numbers.append(float(value))
                 except ValueError as error:
-                    name = {"components": "组分", "reactions": "反应", "materials": "热物性"}[key]
+                    name = {"components": "组分", "reactions": "反应", "materials": "热物性", "gas_species": "气体组分"}[key]
                     raise ValueError(f"{name}第 {index} 行存在空白或无效数字。") from error
             records.append(cls(*values[:text_columns], *numbers))
         return tuple(records)
@@ -1944,9 +2144,22 @@ class ReactionTableEditor:
                 tr = float(self.reference.get())
             except ValueError as error:
                 raise ValueError("请输入开尔文参考温度 Tr。") from error
-            network = ReactionNetwork(self.read_rows("components", Component, 1),
-                                      self.read_rows("reactions", NetworkReaction, 2),
-                                      self.read_rows("materials", SpeciesThermal, 1), tr)
+            gases = self.read_rows("gas_species", GasSpecies, 1)
+            self.refresh_matrix()
+            reactions = []
+            for i, (r, entries) in enumerate(zip(self.read_rows("reactions", NetworkReaction, 2), self.rows["reactions"]), 1):
+                try:
+                    yields = tuple(float(self.yield_vars[entries[0], g[0]].get().strip() or 0) for g in self.rows["gas_species"])
+                except ValueError as error:
+                    raise ValueError(f"气体产率矩阵第 {i} 行含无效数值。") from error
+                reactions.append(replace(r, gas_yields=yields))
+            try:
+                porosity = float(self.porosity.get())
+            except ValueError as error:
+                raise ValueError("请输入一维连通孔隙率（%）。") from error
+            vent = next(k for k, label in VENTS.items() if self.gas_vent.get() == label)
+            network = ReactionNetwork(self.read_rows("components", Component, 1), tuple(reactions),
+                                      self.read_rows("materials", SpeciesThermal, 1), tr, gases, porosity, vent)
             network.validate()
         except ValueError as error:
             self.status.set(str(error))
@@ -2947,7 +3160,7 @@ class SectionParameters:
     end_thickness: float = 80.0  # % initial thickness at complete virgin conversion
     porosity_raw: float = 30.0   # connected pore volume, %
     porosity_end: float = 60.0
-    diffusivity: float = 2e-6    # unimpeded gas diffusivity, m²/s
+    diffusivity: float = DEFAULT_GAS_DIFFUSIVITY    # fallback free gas diffusivity, m²/s
     vent: str = "front"
 
 
@@ -2986,13 +3199,16 @@ class SectionFrame:
     pore: float
     front_out: float
     back_out: float
+    gas_balance: tuple[GasBalance, ...] = ()
+    gas_concentrations: tuple[tuple[float, ...], ...] = ()
 
 
 @dataclass(frozen=True)
 class SectionResult:
     settings: SectionParameters
     frames: tuple[SectionFrame, ...]
-    mass_error: float         # max absolute relative error over all steps
+    mass_error: float         # max balance error normalized by initial dry mass
+    gas_names: tuple[str, ...] = ()
 
 
 def section_sweep(values, capacity, mobility, lines, dt, spacing, boundary):
@@ -3018,6 +3234,78 @@ def section_sweep(values, capacity, mobility, lines, dt, spacing, boundary):
             values[i] = value
 
 
+class PoreGasGrid:
+    """Species stocks per initial dry-solid mass. Positive face fluxes point outward."""
+    def __init__(self, species, count, density, pore_fraction, shared_diffusivity):
+        self.species = species
+        self.count = count
+        self.density = density
+        self.pore_fraction = pore_fraction
+        self.diffusivities = tuple(shared_diffusivity if g.diffusivity is None else g.diffusivity for g in species)
+        self.initial = tuple(g.initial_concentration * pore_fraction / density for g in species)
+        self.mass = [[initial] * count for initial in self.initial]
+        self.produced = [0.0] * len(species)  # summed across cells; divide by count for a sample average
+        self.consumed = [0.0] * len(species)
+        self.front = [0.0] * len(species)     # integrated face flux per initial sample mass
+        self.back = [0.0] * len(species)
+
+    def available_fractions(self, cell, proposals):
+        requested = [0.0] * len(self.species)
+        for _, edge, amount in proposals:
+            for j, y in enumerate(edge.gas_yields):
+                if y < 0:
+                    requested[j] -= amount * (1 - edge.retained) * y
+        return tuple(min(1.0, stock[cell] / need) if need else 1.0 for stock, need in zip(self.mass, requested))
+
+    def record(self, cell, made, used):
+        for j, (source, sink) in enumerate(zip(made, used)):
+            self.mass[j][cell] = max(0.0, self.mass[j][cell] - sink) + source
+            self.produced[j] += source
+            self.consumed[j] += sink
+
+    def balances(self):
+        return tuple(GasBalance(100 * made / self.count, 100 * used / self.count,
+                                100 * math.fsum(stock) / self.count, 100 * front, 100 * back)
+                     for stock, made, used, front, back in
+                     zip(self.mass, self.produced, self.consumed, self.front, self.back))
+
+    def error(self, balances, solid):
+        stocks = math.fsum(b.pore + b.front + b.back for b in balances) / 100
+        total_error = abs(solid + stocks - 1 - math.fsum(self.initial))
+        return max(total_error, *(abs(initial + (b.produced - b.consumed - b.pore - b.front - b.back) / 100)
+                                  for initial, b in zip(self.initial, balances)))
+
+    def concentrations(self, pores, scale):
+        factors = [self.density / (f * scale) for f in pores]
+        return tuple(tuple(m * rho for m, rho in zip(stock, factors)) for stock in self.mass)
+
+    def transport_slab(self, dt, dz, vent):
+        self.transport([self.pore_fraction] * self.count, 1.0, dt, dz, dz, (), (range(self.count),), vent)
+
+    def transport(self, pores, scale, dt, dx, dz0, rows, columns, vent):
+        dz = dz0 * scale
+        rho = self.density / scale
+        weight = dt / (self.count * rho)
+        for j, (stock, species, diffusivity) in enumerate(zip(self.mass, self.species, self.diffusivities)):
+            outside = species.ambient_concentration
+            if not diffusivity or (not any(stock) and (not outside or vent == "closed")):
+                continue
+            concentration = [m * rho / f for m, f in zip(stock, pores)]
+            mobility = [diffusivity * f ** 1.5 for f in pores]
+            section_sweep(concentration, pores, mobility, rows, dt, dx, {})
+            boundary = {}
+            for col in columns:
+                for i, side in ((col[0], "front"), (col[-1], "back")):
+                    coeff = 2 * mobility[i] / dz**2 if vent in (side, "both") else 0.0
+                    boundary[i] = (coeff, coeff * outside)
+            section_sweep(concentration, pores, mobility, columns, dt, dz, boundary)
+            for i, (f, c) in enumerate(zip(pores, concentration)):
+                stock[i] = f * c / rho
+            for face, total in ((0, self.front), (-1, self.back)):
+                total[j] += weight * math.fsum(boundary[col[face]][0] * (concentration[col[face]] - outside)
+                                               for col in columns)
+
+
 def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False, report=lambda n: None):
     """Inert x-z material grid with conservative volatile diffusion in moving pore volumes."""
     validate_slab(p)
@@ -3027,8 +3315,10 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
     steps = math.ceil(p.duration / p.step)
     dt = p.duration / steps
     multi = isinstance(kinetics, SlabMechanism)
-    network = ReactionGrid(kinetics, count) if isinstance(kinetics, ReactionNetwork) else None
-    single = kinetics is not None and not multi and network is None
+    model = kinetics if isinstance(kinetics, ReactionNetwork) else None
+    if model:
+        model.validate()
+    single = kinetics is not None and not multi and model is None
     if multi:
         validate_mechanism(kinetics)
         r1, r2 = kinetics.first, kinetics.second
@@ -3054,14 +3344,18 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
     flux = [1000 * p.flux * max(0.0, min(i + 1, exposed_right) - max(i, exposed_left))
             for i in range(nx)]
     ambient = p.ambient + KELVIN
-    mixture = SolidMixture(kinetics, ambient) if network is not None and kinetics.materials else None
+    mixture = SolidMixture(model, ambient) if model and model.materials else None
     initial_density = mixture.initial_density if mixture else p.density
     sigma = STEFAN_BOLTZMANN * p.emissivity
     front, back = [ambient] * nx, [ambient] * nx
     temperature = [ambient] * count
-    raw, mid, char, gas = [1.0] * count, [0.0] * count, [0.0] * count, [0.0] * count
-    front_out = back_out = mass_error = 0.0
-    open_front, open_back = s.vent in ("front", "both"), s.vent in ("back", "both")
+    raw, mid, char = [1.0] * count, [0.0] * count, [0.0] * count
+    network = (ReactionGrid(model, count, density=initial_density, pore_fraction=s.porosity_raw / 100,
+                            diffusivity=s.diffusivity) if model else None)
+    named = network.gases if network else None
+    pore = named or PoreGasGrid((GasSpecies("gases"),), count, initial_density, s.porosity_raw / 100, s.diffusivity)
+    balances = pore.balances()
+    mass_error = 0.0
     every = max(1, math.ceil(steps / 160))
 
     def stretch():
@@ -3090,7 +3384,8 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
                 else:
                     released, absorbed, consumed = network.advance(i, t, dt / 2)
                     temperature[i] -= absorbed / p.heat_capacity
-                gas[i] += released
+                if not named:
+                    pore.mass[0][i] += released
                 raw[i] = max(0.0, raw[i] - consumed)
             check_temperature()
             return
@@ -3105,14 +3400,14 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
                 raw[i] = max(0.0, raw[i] - first - (second if parallel else 0.0))
                 mid[i] = next_mid
                 char[i] += second * y2 + (first * y1 if parallel else 0.0)
-                gas[i] += first * (1 - y1) + second * (1 - y2)
+                pore.mass[0][i] += first * (1 - y1) + second * (1 - y2)
                 new_capacity, _ = thermal(i, scale)
                 temperature[i] -= p.density * (first * h1 + second * h2) / ((old_capacity + new_capacity) / 2)
             else:
                 first = raw[i] * -math.expm1(-k1 * dt / 2)
                 raw[i] -= first
                 char[i] += first * y1
-                gas[i] += first * (1 - y1)
+                pore.mass[0][i] += first * (1 - y1)
                 temperature[i] -= first * h1 / p.heat_capacity
         check_temperature()
 
@@ -3141,37 +3436,17 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
         for face, j, i, resistance, sink, source in faces:
             face[j] = temperature[i] + resistance * (source - sink * temperature[i])
 
-    def transport(scale):
-        if s.diffusivity == 0 or not any(gas):
-            return 0.0, 0.0
-        dz = dz0 * scale
-        phi = pores()
-        ref_density = initial_density / scale
-        concentration = [m * ref_density / f for m, f in zip(gas, phi)]
-        # Superficial diffusive flux = -D_free * phi^(3/2) * grad(pore concentration).
-        mobility = [s.diffusivity * f ** 1.5 for f in phi]
-        section_sweep(concentration, phi, mobility, rows, dt, dx, {})
-        boundary = {}
-        for col in columns:
-            for i, opened in ((col[0], open_front), (col[-1], open_back)):
-                boundary[i] = (2 * mobility[i] / dz ** 2 if opened else 0.0, 0.0)
-        section_sweep(concentration, phi, mobility, columns, dt, dz, boundary)
-        for i, c in enumerate(concentration):
-            gas[i] = phi[i] * c / ref_density
-        # Integrate face fluxes independently of the solid and pore inventories.
-        weight = dt / (count * ref_density)
-        return tuple(weight * sum(boundary[col[face]][0] * concentration[col[face]] for col in columns)
-                     for face in (0, -1))
-
     def frame(t, scale):
         if network is None:
             residual = tuple(100 * (u + v + w) for u, v, w in zip(raw, mid, char))
         else:
             residual = tuple(100 * sum(mass) for mass in network.mass)
-        c = tuple(g * initial_density / (f * scale) for g, f in zip(gas, pores()))
+        fields = pore.concentrations(pores(), scale)
+        concentration = tuple(map(math.fsum, zip(*fields))) if named else fields[0]
         return SectionFrame(t, p.thickness * scale, tuple(value - KELVIN for value in temperature),
-                            residual, c, sum(residual) / count, 100 * sum(gas) / count,
-                            100 * front_out, 100 * back_out)
+                            residual, concentration, sum(residual) / count, sum(b.pore for b in balances),
+                            sum(b.front for b in balances), sum(b.back for b in balances),
+                            balances if named else (), fields if named else ())
 
     scale = 1.0
     frames = [frame(0.0, scale)]
@@ -3190,19 +3465,21 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
         if mixture:
             update_material_surfaces(temperature, faces)
         scale = stretch()
-        out_f, out_b = transport(scale)
-        front_out += out_f
-        back_out += out_b
+        pore.transport(pores(), scale, dt, dx, dz0, rows, columns, s.vent)
+        balances = pore.balances()
         condensed = sum(raw) + sum(mid) + sum(char) if network is None else sum(map(sum, network.mass))
-        total = (condensed + sum(gas)) / count + front_out + back_out
-        mass_error = max(mass_error, abs(total - 1))
+        if named:
+            mass_error = max(mass_error, pore.error(balances, condensed / count))
+        else:
+            b = balances[0]
+            mass_error = max(mass_error, abs(condensed / count + (b.pore + b.front + b.back) / 100 - 1))
         if step % every == 0 or step == steps:
             frames.append(frame(step * dt, scale))
         percent = 100 * step // steps
         if percent != last_percent:
             report(percent)
             last_percent = percent
-    return SectionResult(s, tuple(frames), mass_error)
+    return SectionResult(s, tuple(frames), mass_error, model.gas_names if named else ())
 
 
 def export_section(path, result, index=None):
@@ -3210,18 +3487,20 @@ def export_section(path, result, index=None):
         writer = csv.writer(file)
         if index is None:
             writer.writerow(("time_s", "thickness_mm", "solid_pct_initial", "pore_gas_pct_initial",
-                             "escaped_front_pct_initial", "escaped_back_pct_initial"))
+                             "escaped_front_pct_initial", "escaped_back_pct_initial", *gas_csv_headers(result.gas_names)))
             for f in result.frames:
-                writer.writerow((f.time, f.thickness, f.solid, f.pore, f.front_out, f.back_out))
+                writer.writerow((f.time, f.thickness, f.solid, f.pore, f.front_out, f.back_out,
+                                 *gas_csv_values(f.gas_balance)))
             return
         f, s = result.frames[index], result.settings
         nx, nz = int(s.nx), int(s.nz)
         writer.writerow(("time_s", "x_center_mm", "z_center_mm", "thickness_mm", "temperature_C",
-                         "local_solid_pct_initial", "gas_kg_per_m3_pore"))
+                         "local_solid_pct_initial", "gas_kg_per_m3_pore",
+                         *(f"gas_{name}_kg_per_m3_pore" for name in result.gas_names)))
         for i, (t, solid, concentration) in enumerate(zip(f.temperature, f.residual, f.concentration)):
             z, x = divmod(i, nx)
             writer.writerow((f.time, (x + .5) * s.width / nx, (z + .5) * f.thickness / nz,
-                             f.thickness, t, solid, concentration))
+                             f.thickness, t, solid, concentration, *(c[i] for c in f.gas_concentrations)))
 
 
 SLAB_VIEWS = {
@@ -3233,10 +3512,12 @@ SLAB_VIEWS = {
     "probe_temperature": "测点温度",
     "probe_residual": "测点局部剩余质量",
     "composition": "整体组分",
+    "gas_balance": "气体质量收支",
 }
 PROFILES = {"profile", "residual_profile"}
 CASE_FORMAT = "pyro-ignition-lab/slab"
-CASE_VERSION = 3
+CASE_VERSION = 4
+CASE_MAX_BYTES = 32 * 1024 ** 2
 
 
 def slab_probe(result, depth):
@@ -3284,6 +3565,7 @@ class SlabCase:
     view: str = "temperature"
     time_index: int = 0
     section: SectionParameters | None = None
+    selected_gas: str | None = None
 
 
 def save_slab_case(path, case):
@@ -3303,21 +3585,39 @@ def save_slab_case(path, case):
                 if row[key] == default:
                     del row[key]
                 else:
-                    version = CASE_VERSION
+                    version = 3
             for key in ("heat", "solid_heat", "gas_heat"):
                 if row[key] is None:
                     del row[key]
+        if case.kinetics.gas_species or case.kinetics.slab_porosity != 30 or case.kinetics.slab_vent != "front":
+            version = CASE_VERSION
+        else:
+            for key in ("gas_species", "slab_porosity", "slab_vent"):
+                del network[key]
+            for row in network["reactions"]:
+                del row["gas_yields"]
         reactions = {"type": "network", "data": network}
     elif isinstance(case.kinetics, SlabMechanism):
         reactions = {"type": "multistep", "data": asdict(case.kinetics)}
     else:
         reactions = {"type": "single", "data": case.kinetics}
+    if case.view == "gas_balance":
+        version = CASE_VERSION
     payload = {
         "format": CASE_FORMAT, "version": version, "parameters": asdict(case.parameters),
         "kinetics": reactions,
         "result": asdict(case.result) if case.result else None,
         "view": {"probe_depth_mm": case.probe_depth, "plot": case.view, "time_index": case.time_index},
     }
+    if case.selected_gas is not None:
+        if (case.view != "gas_balance" or not isinstance(case.kinetics, ReactionNetwork)
+                or case.selected_gas not in case.kinetics.gas_names):
+            raise ValueError("视图所选气体须在气体组分表中。")
+        payload["view"]["gas_species"] = case.selected_gas
+    if case.result and not case.result.gas_names:
+        del payload["result"]["gas_names"]
+        for row in payload["result"]["frames"]:
+            del row["gas_balance"]
     if case.section is not None:
         validate_section(case.section)
         payload["section"] = asdict(case.section)
@@ -3326,6 +3626,8 @@ def save_slab_case(path, case):
                                          prefix=".pyro-", suffix=".tmp", delete=False) as file:
             temp_path = Path(file.name)
             json.dump(payload, file, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        if temp_path.stat().st_size > CASE_MAX_BYTES:
+            raise ValueError("含结果的算例超过 32 MB，请减少网格或采样数后再保存。")
         os.replace(temp_path, target)
     finally:
         if temp_path is not None:
@@ -3354,7 +3656,7 @@ def case_vector(data, size):
     return tuple(checked_case_number(value) for value in data)
 
 
-def decode_case_result(data, parameters, multistep, component_names=()):
+def decode_case_result(data, parameters, multistep, component_names=(), gas_names=(), initial_pore=()):
     if not isinstance(data, dict):
         raise ValueError("算例结果格式有误。")
     count = int(parameters.cells)
@@ -3365,6 +3667,8 @@ def decode_case_result(data, parameters, multistep, component_names=()):
     stored_names = data.get("component_names", [])
     if not isinstance(stored_names, list) or tuple(stored_names) != component_names:
         raise ValueError("算例结果与反应表的组分顺序不一致。")
+    if data.get("gas_names", []) != list(gas_names):
+        raise ValueError("算例结果与气体产率表的气体顺序不一致。")
     ncomp = len(component_names) + 1 if component_names else (4 if multistep else 0)
     rows = data.get("frames")
     if not isinstance(rows, list) or not 2 <= len(rows) <= 1602:
@@ -3391,18 +3695,33 @@ def decode_case_result(data, parameters, multistep, component_names=()):
         if composition and (abs(sum(composition) - 100) > 1e-6
                             or abs(sum(composition[:-1]) - numbers["remaining_mass"]) > 1e-6):
             raise ValueError("算例的组分与剩余质量不一致。")
-        frames.append(SlabFrame(**numbers, temperature=temp, residual=residual, composition=composition))
+        values = row.get("gas_balance", [])
+        if not isinstance(values, list) or len(values) != len(gas_names):
+            raise ValueError("算例结果的气体质量收支缺失或长度有误。")
+        balances = tuple(GasBalance(**checked_case_fields(v, (f.name for f in fields(GasBalance)))) for v in values)
+        for j, b in enumerate(balances):
+            prev = frames[-1].gas_balance[j] if frames else GasBalance(0, 0, initial_pore[j], 0, 0)
+            if (min(b.produced - prev.produced, b.consumed - prev.consumed, b.pore) < -1e-7
+                    or (not frames and max(map(abs, (b.produced, b.consumed, b.front, b.back))) > 1e-7)
+                    or not math.isclose(initial_pore[j] + b.produced - b.consumed,
+                                        b.pore + b.front + b.back, rel_tol=1e-8, abs_tol=1e-6)):
+                raise ValueError(f"算例结果中 {gas_names[j]} 的质量收支不一致。")
+        if balances and not math.isclose(math.fsum(b.produced - b.consumed for b in balances),
+                                         composition[-1], rel_tol=1e-8, abs_tol=1e-6):
+            raise ValueError("各气体的净生成量与凝聚相挥发量不一致。")
+        frames.append(SlabFrame(**numbers, temperature=temp, residual=residual, composition=composition,
+                                gas_balance=balances))
     if frames[0].time != 0 or not math.isclose(previous, parameters.duration, abs_tol=1e-7):
         raise ValueError("算例结果的起止时刻与模拟时长不一致。")
     summary = [checked_case_number(data.get(key)) for key in ("peak_loss", "mass_error", "energy_error")]
     if any(value < 0 for value in summary) or summary[0] + 1e-8 < max(frame.loss_rate for frame in frames):
         raise ValueError("算例结果的汇总数据无效。")
-    return SlabResult(expected, tuple(frames), *summary, component_names)
+    return SlabResult(expected, tuple(frames), *summary, component_names, gas_names)
 
 
 def load_slab_case(path):
     path = Path(path)
-    if path.stat().st_size > 32 * 1024 ** 2:
+    if path.stat().st_size > CASE_MAX_BYTES:
         raise ValueError("算例文件超过 32 MB。")
     try:
         with path.open(encoding="utf-8-sig") as file:
@@ -3410,7 +3729,7 @@ def load_slab_case(path):
     except (UnicodeError, ValueError, RecursionError) as error:
         raise ValueError("无法读取算例 JSON。") from error
     if (not isinstance(data, dict) or data.get("format") != CASE_FORMAT
-            or type(data.get("version")) is not int or data.get("version") not in (1, 2, CASE_VERSION)):
+            or type(data.get("version")) is not int or data.get("version") not in (1, 2, 3, CASE_VERSION)):
         raise ValueError("算例格式或版本不受支持。")
     parameters = SlabParameters(**checked_case_fields(data.get("parameters"), (v[0] for v in SLAB_FIELDS)))
     validate_slab(parameters)
@@ -3419,7 +3738,7 @@ def load_slab_case(path):
         raise ValueError("算例的反应模型格式有误。")
     multi = reactions["type"] == "multistep"
     source = reactions.get("data")
-    component_names = ()
+    component_names, gas_names, initial_pore = (), (), ()
     if reactions["type"] == "network":
         if not isinstance(source, dict):
             raise ValueError("算例缺少组分与反应表。")
@@ -3435,8 +3754,18 @@ def load_slab_case(path):
                     raise ValueError("组分或反应行的字段不完整。")
                 if any(not isinstance(row[k], str) for k in strings if k in row):
                     raise ValueError("组分名称必须是文本。")
-                numeric = {k: checked_case_number(v) for k, v in row.items() if k not in strings
-                           and not (v is None and cls is NetworkReaction and k in ("heat", "solid_heat", "gas_heat"))}
+                numeric = {}
+                for k, v in row.items():
+                    if k in strings:
+                        continue
+                    if k == "gas_yields":
+                        if not isinstance(v, list):
+                            raise ValueError("气体产率行须为数值数组。")
+                        numeric[k] = tuple(checked_case_number(y) for y in v)
+                    elif v is None and k in ("diffusivity", "heat", "solid_heat", "gas_heat"):
+                        continue
+                    else:
+                        numeric[k] = checked_case_number(v)
                 if "kinetic_model" in numeric:
                     if not numeric["kinetic_model"].is_integer():
                         raise ValueError("动力学模型编号须为整数。")
@@ -3446,9 +3775,15 @@ def load_slab_case(path):
         kinetics = ReactionNetwork(records("components", Component, ("name",)),
                                    records("reactions", NetworkReaction, ("source", "target", "catalyst")),
                                    records("materials", SpeciesThermal, ("name",)) if "materials" in source else (),
-                                   checked_case_number(source.get("reference_temperature", 298.15)))
+                                   checked_case_number(source.get("reference_temperature", 298.15)),
+                                   records("gas_species", GasSpecies, ("name",)) if "gas_species" in source else (),
+                                   checked_case_number(source.get("slab_porosity", 30)), source.get("slab_vent", "front"))
         kinetics.validate()
-        component_names = kinetics.names
+        component_names, gas_names = kinetics.names, kinetics.gas_names
+        if gas_names:
+            density = (SolidMixture(kinetics, parameters.ambient + KELVIN).initial_density
+                       if kinetics.materials else parameters.density)
+            initial_pore = tuple(g.initial_concentration * kinetics.slab_porosity / density for g in kinetics.gas_species)
     elif multi:
         if not isinstance(source, dict):
             raise ValueError("算例缺少多步反应参数。")
@@ -3472,7 +3807,8 @@ def load_slab_case(path):
     depth = checked_case_number(view.get("probe_depth_mm"))
     if not 0 <= depth <= parameters.thickness:
         raise ValueError("算例测点不在平板范围内。")
-    result = decode_case_result(data["result"], parameters, multi, component_names) if data.get("result") is not None else None
+    result = (decode_case_result(data["result"], parameters, multi, component_names, gas_names, initial_pore)
+              if data.get("result") is not None else None)
     index = view.get("time_index")
     if type(index) is not int or not 0 <= index < (len(result.frames) if result else 1):
         raise ValueError("算例的剖面时刻无效。")
@@ -3486,7 +3822,10 @@ def load_slab_case(path):
         section = SectionParameters(**values, vent=source["vent"])
         validate_section(section)
         section = replace(section, nx=int(section.nx), nz=int(section.nz))
-    return SlabCase(parameters, kinetics, result, depth, view["plot"], index, section)
+    selected_gas = view.get("gas_species")
+    if selected_gas is not None and (view["plot"] != "gas_balance" or selected_gas not in gas_names):
+        raise ValueError("视图所选气体与气体组分表不一致。")
+    return SlabCase(parameters, kinetics, result, depth, view["plot"], index, section, selected_gas)
 
 
 SECTION_QUANTITIES = {
@@ -3497,11 +3836,11 @@ SECTION_QUANTITIES = {
 
 SECTION_HELP = """二维截面在惰性气氛中计算宽向 x 与厚向 z 的导热。受热面为 z = 0。正面中央条带输入平板设置的吸收热通量，两面均与环境对流和辐射换热。两侧绝热且封闭。单元中心温度和固体质量随时间输出。
 
-每次运行读取一维平板中当前的样品、传热、反应和时间设置。宽向与厚向网格数在本窗口单独指定。单步模型采用固定的参考热物性，预设两步机制采用组分热物性。自定义反应表沿用一维中填写的组分热物性与分项反应热，热物性表为空时使用平板公共参数。反应产生的单一等效挥发物进入当地连通孔隙，再沿两个方向扩散。有效扩散系数为自由气体扩散系数乘以孔隙率的 1.5 次方。开放面取外部挥发物浓度为零，封闭面取零通量。结果计入孔内库存以及两面的净排出量。
+每次运行读取一维平板中当前的样品、传热、反应和时间设置。宽向与厚向网格数在本窗口单独指定。单步模型采用固定的参考热物性，预设两步机制采用组分热物性。自定义反应表沿用一维中填写的组分热物性与分项反应热，热物性表为空时使用平板公共参数。在「气体组分」和「气体产率矩阵」中可指定每条反应生成和消耗的各气体。每种气体在当地孔隙中独立扩散，有效扩散系数为各自的自由扩散系数乘以孔隙率的 1.5 次方。开放面取各气体填写的外界浓度，封闭面通量为零。气体表留空时采用一种等效挥发物，外界浓度为零。
 
 完全转化厚度以初始厚度为 100%。例如 80% 表示缩至 0.8 倍，120% 表示膨胀至 1.2 倍。厚度随原材料平均转化率线性变化，宽度固定，各列同步伸缩。孔隙率则随各单元原材料转化率在两个输入端点间插值。几何伸缩和孔隙率是独立指定的经验关系。模型假设孔隙中的气体以扩散传质，忽略压力驱动流动、气体携热及变形功。
 
-色标在一次计算的所有时刻固定。纵轴按该次计算的最大厚度绘制，横纵轴分别标度。悬停可读取单元中心值。质量汇总以初始试样质量为基准。时间历程 CSV 给出厚度和四项质量，当前截面 CSV 给出网格中心的物理坐标和三个场。
+色标在一次计算的所有时刻固定。纵轴按该次计算的最大厚度绘制，横纵轴分别标度。悬停可读取单元中心值。质量汇总以初始干样质量为基准。下拉菜单可选择每种气体的孔内浓度，单位 kg/m³ 孔隙。时间历程 CSV 包含厚度、固体、各气体的生成、消耗、库存与两面净排出，截面 CSV 含物理坐标、温度、局部固体与气体浓度。
 
 在一维平板窗口保存算例可同时保存本窗口的参数。打开算例后运行二维计算即可重建各时刻的截面。示例参数用于检查模型行为，实际材料需用实验标定孔隙率、扩散系数和厚度演化。"""
 
@@ -3660,6 +3999,13 @@ class SectionWindow:
                 "temperature": (min(min(f.temperature) for f in frames), max(max(f.temperature) for f in frames)),
                 "concentration": (0.0, max(max(f.concentration) for f in frames)), "residual": (0.0, 100.0),
             }
+            choices = list(SECTION_QUANTITIES)
+            for j, name in enumerate(value.gas_names):
+                choices.append(f"气体 · {name} (kg/m³ 孔隙)")
+                self.limits[j] = (0.0, max(max(f.gas_concentrations[j]) for f in frames))
+            self.quantity.configure(values=choices)
+            if self.quantity.get() not in choices:
+                self.quantity.current(0)
             self.scale.configure(state="normal", to=len(frames) - 1)
             self.position.set(len(frames) - 1)
             for button in self.exports:
@@ -3690,14 +4036,16 @@ class SectionWindow:
             c.create_text(w / 2, h / 2, text="运行二维模拟后查看截面", fill=MUTED)
             return
         f, s = self.result.frames[self.index()], self.result.settings
-        key = SECTION_QUANTITIES[self.quantity.get()]
+        j = self.quantity.current() - len(SECTION_QUANTITIES)
+        key = j if j >= 0 else SECTION_QUANTITIES[self.quantity.get()]
+        values = f.gas_concentrations[j] if j >= 0 else getattr(f, key)
         lo, hi = self.limits[key]
         nx, nz = int(s.nx), int(s.nz)
         left, right, top = 49, w - 19, 36
         bottom = top + (h - 100) * f.thickness / self.max_depth
         dx, dz = (right - left) / nx, (bottom - top) / nz
         self.plot_box = (left, right, top, bottom, dx, dz)
-        for i, val in enumerate(getattr(f, key)):
+        for i, val in enumerate(values):
             z, x = divmod(i, nx)
             fraction = (val - lo) / (hi - lo) if hi > lo else 0.0
             c.create_rectangle(left + dx * x, top + dz * z, left + dx * (x + 1), top + dz * (z + 1),
@@ -3713,13 +4061,19 @@ class SectionWindow:
         c.create_text(left, bottom + 11, text="0", fill=MUTED)
         c.create_text(right, bottom + 11, text=f"{s.width:g}", fill=MUTED)
         c.create_text(mid, bottom + 13, text="宽 x (mm)    /    深 z (mm)", fill=MUTED)
-        for j in range(48):
-            c.create_rectangle(left + (right - left) * j / 48, h - 29, left + (right - left) * (j + 1) / 48,
-                               h - 21, outline="", fill=self.color(j / 47 if hi > lo else 0))
+        for tick in range(48):
+            c.create_rectangle(left + (right - left) * tick / 48, h - 29, left + (right - left) * (tick + 1) / 48,
+                               h - 21, outline="", fill=self.color(tick / 47 if hi > lo else 0))
         c.create_text(left, h - 12, text=f"{lo:.4g}", anchor="w", fill=MUTED)
         c.create_text(right, h - 12, text=f"{hi:.4g}", anchor="e", fill=MUTED)
-        self.summary.set(f"{f.time:.2f} s   ·   厚度 {f.thickness:.3f} mm   ·   剩余固体 {f.solid:.2f}%\n"
-                         f"孔内 {f.pore:.3f}%   ·   正面排出 {f.front_out:.3f}%   ·   背面排出 {f.back_out:.3f}%")
+        headline = f"{f.time:.2f} s   ·   厚度 {f.thickness:.3f} mm   ·   剩余固体 {f.solid:.2f}%"
+        if j >= 0:
+            b = f.gas_balance[j]
+            detail = (f"{self.result.gas_names[j]} · 生成 {b.produced:.3f}% · 消耗 {b.consumed:.3f}% · 孔内 {b.pore:.3f}%"
+                      f"\n正面净排出 {b.front:.3f}% · 背面净排出 {b.back:.3f}%")
+        else:
+            detail = f"孔内 {f.pore:.3f}%   ·   正面净排出 {f.front_out:.3f}%   ·   背面净排出 {f.back_out:.3f}%"
+        self.summary.set(headline + "\n" + detail)
 
     def hover(self, event):
         if self.result is None or not hasattr(self, "plot_box"):
@@ -3732,8 +4086,11 @@ class SectionWindow:
         x, z = int((event.x - left) / dx), int((event.y - top) / dz)
         nx, nz = int(s.nx), int(s.nz)
         i = z * nx + x
+        j = self.quantity.current() - len(SECTION_QUANTITIES)
+        name = self.result.gas_names[j] if j >= 0 else "孔内气体"
+        concentration = f.gas_concentrations[j][i] if j >= 0 else f.concentration[i]
         self.readout.set(f"x {(x + .5) * s.width / nx:.2f}, z {(z + .5) * f.thickness / nz:.2f} mm"
-                         f"  ·  {f.temperature[i]:.1f} °C  ·  固体 {f.residual[i]:.2f}%  ·  孔内 {f.concentration[i]:.3g} kg/m³")
+                         f"  ·  {f.temperature[i]:.1f} °C  ·  固体 {f.residual[i]:.2f}%  ·  {name} {concentration:.3g} kg/m³")
 
     def export(self, spatial):
         if self.result is None:
@@ -3925,7 +4282,8 @@ class SlabWindow:
         if isinstance(self.mechanism, ReactionNetwork):
             thermal = f"组分热物性 · Tr {self.mechanism.reference_temperature:g} K" if material_mode else "共用平板热物性"
             self.kinetics_label.set(f"自定义模型 · {len(self.mechanism.components)} 种组分"
-                                    f" · {len(self.mechanism.reactions)} 条反应 · {thermal}")
+                                    f" · {len(self.mechanism.reactions)} 条反应 · {thermal}"
+                                    + (f" · {len(self.mechanism.gas_species)} 种气体" if self.mechanism.gas_species else ""))
             return
         if self.mechanism is not None:
             mode = "两步并联" if self.mechanism.mode == "parallel" else "两步串联"
@@ -4147,8 +4505,11 @@ class SlabWindow:
             self.status.set(f"无法保存算例 · {error}")
             return
         result = self.current_result()
+        selected = self.component_choice.get()
+        if self.mode.get() != "gas_balance" or not isinstance(kinetics, ReactionNetwork) or selected not in kinetics.gas_names:
+            selected = None
         case = SlabCase(parameters, kinetics, result, min(self.probe_depth, parameters.thickness),
-                        self.mode.get(), self.frame_index() if result else 0, self.section_settings)
+                        self.mode.get(), self.frame_index() if result else 0, self.section_settings, selected)
         path = self.lab.dialog.asksaveasfilename(parent=self.window, defaultextension=".json",
             initialfile=self.case_name or "slab_case.json", filetypes=[("平板算例", "*.json")])
         if path:
@@ -4189,6 +4550,7 @@ class SlabWindow:
         self.probe_depth = case.probe_depth
         self.probe_input.set(f"{case.probe_depth:.8g}")
         self.mode.set(case.view)
+        self.component_choice.set(case.selected_gas or "")
         self.case_name = Path(path).name
         self.case_label.set(self.case_name)
         self.dirty = case.result is None
@@ -4213,8 +4575,13 @@ class SlabWindow:
             return
         mode = self.mode.get()
         self.plot_choice.set(SLAB_VIEWS[mode])
-        if self.result and self.result.component_names and mode == "composition":
-            names = (*self.result.component_names, "gases")
+        names = ()
+        if self.result:
+            if mode == "composition" and self.result.component_names:
+                names = (*self.result.component_names, "gases")
+            elif mode == "gas_balance":
+                names = self.result.gas_names
+        if names:
             self.component_choice.configure(values=names)
             if self.component_choice.get() not in names:
                 self.component_choice.current(0)
@@ -4253,6 +4620,18 @@ class SlabWindow:
             elif mode == "mass":
                 yname = "剩余质量 (%)"
                 traces = [("剩余质量", NITROGEN, tuple(f.remaining_mass for f in frames))]
+            elif mode == "gas_balance":
+                if not names:
+                    canvas.create_text(w / 2, h / 2, text="在「组分与反应表」填写气体组分和产率矩阵后重新运行。", fill=MUTED)
+                    return
+                j = self.component_choice.current()
+                labels = (("累计生成", AIR, "produced"), ("累计消耗", "#794e99", "consumed"),
+                          ("孔内存量", NITROGEN, "pore"), ("正面净排出", FURNACE, "front"),
+                          ("背面净排出", "#746548", "back"))
+                yname = "占初始干样质量 (%)"
+                traces = [(label, color, tuple(getattr(f.gas_balance[j], field) for f in frames))
+                          for label, color, field in labels]
+                self.frame_label.set("排出为正，流入为负。累计生成与累计消耗分别计数。")
             elif mode == "composition":
                 if not frames[0].composition:
                     canvas.create_text(w / 2, h / 2, text="使用两步反应或自定义反应表运行后显示组分", fill=MUTED)
@@ -4274,6 +4653,9 @@ class SlabWindow:
                 traces = [("受热面", AIR, tuple(f.front for f in frames)),
                           ("背面", NITROGEN, tuple(f.back for f in frames))]
         left, right, top, bottom = 59, w - 18, 35, h - 39
+        if mode == "gas_balance":
+            legend_columns = max(1, min(len(traces), (w - 20) // 90))
+            top = 27 + 17 * math.ceil(len(traces) / legend_columns)
         ymin = min(0, *(min(trace) for _, _, trace in traces))
         ymax = max(1, *(max(trace) for _, _, trace in traces))
         if mode in ("temperature", "profile", "probe_temperature"):
@@ -4297,9 +4679,12 @@ class SlabWindow:
         for i, (name, color, trace) in enumerate(traces):
             coords = [coordinate for x, y in zip(xs, trace) for coordinate in (xx(x), yy(y))]
             canvas.create_line(*coords, fill=color, width=2)
-            x = right - 80 * (len(traces) - i)
-            canvas.create_line(x, 13, x + 16, 13, fill=color, width=2)
-            canvas.create_text(x + 20, 13, text=name, fill=MUTED, anchor="w")
+            if mode == "gas_balance":
+                x, y = 10 + 90 * (i % legend_columns), 27 + 17 * (i // legend_columns)
+            else:
+                x, y = right - 80 * (len(traces) - i), 13
+            canvas.create_line(x, y, x + 16, y, fill=color, width=2)
+            canvas.create_text(x + 20, y, text=name, fill=MUTED, anchor="w")
 
 
 class LabWindow:
