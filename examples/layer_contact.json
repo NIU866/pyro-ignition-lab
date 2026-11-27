@@ -1,0 +1,104 @@
+{
+  "format": "pyro-ignition-lab/slab",
+  "version": 5,
+  "parameters": {
+    "thickness": 3,
+    "density": 550.0,
+    "conductivity": 0.19,
+    "heat_capacity": 1550.0,
+    "flux": 2,
+    "front_h": 0,
+    "back_h": 80,
+    "emissivity": 0,
+    "ambient": 25,
+    "duration": 600,
+    "cells": 13,
+    "step": 1
+  },
+  "kinetics": {
+    "type": "network",
+    "data": {
+      "components": [
+        {
+          "name": "涂层材料",
+          "initial": 0
+        },
+        {
+          "name": "基材材料",
+          "initial": 0
+        }
+      ],
+      "reactions": [],
+      "materials": [
+        {
+          "name": "涂层材料",
+          "density": 300,
+          "heat_capacity": 1200,
+          "conductivity": 0.14,
+          "emissivity": 0,
+          "density_exponent": 0.0,
+          "capacity_exponent": 0.0,
+          "conductivity_exponent": 0.0,
+          "pore_length": 0.0,
+          "melt_heat": 0.0,
+          "melt_temperature": 300.0,
+          "melt_variance": 1.0
+        },
+        {
+          "name": "基材材料",
+          "density": 850,
+          "heat_capacity": 1350,
+          "conductivity": 0.4,
+          "emissivity": 0,
+          "density_exponent": 0.0,
+          "capacity_exponent": 0.0,
+          "conductivity_exponent": 0.0,
+          "pore_length": 0.0,
+          "melt_heat": 0.0,
+          "melt_temperature": 300.0,
+          "melt_variance": 1.0
+        }
+      ],
+      "reference_temperature": 298.15,
+      "layers": [
+        {
+          "name": "表层",
+          "thickness": 0.7,
+          "fractions": [
+            1,
+            0
+          ],
+          "contact": 0.002,
+          "initial_temperature": null
+        },
+        {
+          "name": "基材",
+          "thickness": 2.3,
+          "fractions": [
+            0,
+            1
+          ],
+          "contact": 0.0,
+          "initial_temperature": null
+        }
+      ]
+    }
+  },
+  "result": null,
+  "view": {
+    "probe_depth_mm": 0.7,
+    "plot": "interfaces",
+    "time_index": 0
+  },
+  "section": {
+    "width": 30.0,
+    "nx": 5,
+    "nz": 13,
+    "heated": 100,
+    "end_thickness": 100,
+    "porosity_raw": 30.0,
+    "porosity_end": 60.0,
+    "diffusivity": 2e-06,
+    "vent": "front"
+  }
+}

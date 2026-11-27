@@ -765,6 +765,7 @@ class SlabFrame:
     loss_rate: float       # g/(m² s), step average
     composition: tuple[float, ...] = ()  # condensed components followed by generated gas (% initial)
     gas_balance: tuple[GasBalance, ...] = ()
+    interface_values: tuple[tuple[float, float, float], ...] = ()  # front °C, back °C, W/m² toward back
 
 
 @dataclass(frozen=True)
@@ -776,6 +777,7 @@ class SlabResult:
     energy_error: float
     component_names: tuple[str, ...] = ()  # named condensed species; gas is the final composition column
     gas_names: tuple[str, ...] = ()
+    interfaces: tuple[DepthInterface, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1080,6 +1082,92 @@ class GasSpecies:
 
 
 @dataclass(frozen=True)
+class MaterialLayer:
+    name: str
+    thickness: float                   # nominal thickness, mm, in front-to-back order
+    fractions: tuple[float, ...]       # local mass fractions in condensed-species order
+    contact: float = 0.0               # m² K/W, between this layer and the next
+    initial_temperature: float | None = None  # °C; None inherits the sample ambient
+
+
+@dataclass(frozen=True)
+class DepthInterface:
+    depth: float                       # mm from heated face
+    cell: int                          # last cell on the heated side
+    front_layer: str
+    back_layer: str
+    resistance: float
+
+
+class LayerMesh:
+    """Depth cells fit every layer exactly. Inventories use one common mass unit per cell."""
+    def __init__(self, model, p, nz, nx=1):
+        layers = model.layers
+        if nz < len(layers):
+            raise ValueError(f"有 {len(layers)} 层，厚向网格数至少应为 {len(layers)}。")
+        length = math.fsum(layer.thickness for layer in layers)
+        quotas = [nz * (layer.thickness / length) for layer in layers]
+        counts = [max(1, math.floor(q)) for q in quotas]
+        while sum(counts) < nz:
+            j = max(range(len(layers)), key=lambda i: quotas[i] - counts[i])
+            counts[j] += 1
+        while sum(counts) > nz:
+            j = max((i for i, c in enumerate(counts) if c > 1), key=lambda i: counts[i] - quotas[i])
+            counts[j] -= 1
+
+        props = {m.name: m for m in model.materials}
+        widths, stocks, temperatures, densities, names = [], [], [], [], []
+        interfaces, edges = [], [0.0]
+        offset = 0.0
+        for j, (layer, n) in enumerate(zip(layers, counts)):
+            thickness = p.thickness * (layer.thickness / length)
+            temp = (p.ambient if layer.initial_temperature is None else layer.initial_temperature) + KELVIN
+            total = math.fsum(layer.fractions)
+            fractions = tuple(w / total for w in layer.fractions)
+            rho = (1 / math.fsum(w / props[name].bulk_density(temp, model.reference_temperature)
+                                 for name, w in zip(model.names, fractions) if w) if props else p.density)
+            widths.extend([thickness / (1000 * n)] * n)
+            densities.extend([rho] * n)
+            stocks.extend([fractions] * n)
+            temperatures.extend([temp] * n)
+            names.extend([layer.name] * n)
+            edges.extend(offset + thickness * i / n for i in range(1, n + 1))
+            offset += thickness
+            if j + 1 < len(layers):
+                interfaces.append(DepthInterface(offset, len(widths) - 1, layer.name, layers[j+1].name, layer.contact))
+        edges[-1] = p.thickness
+        if any(b <= a for a, b in zip(edges, edges[1:])) or min(widths) <= 0:
+            raise ValueError("层厚之比超出坐标的数值精度，请核对各层厚度及其单位。")
+        self.widths = tuple(widths)
+        self.edges = tuple(edges)
+        self.depths = (0.0, *((a + b) / 2 for a, b in zip(edges, edges[1:])), p.thickness)
+        self.names = tuple(names)
+        self.interfaces = tuple(interfaces)
+        self.contacts = [0.0] * (nz - 1)
+        for face in interfaces:
+            self.contacts[face.cell] = face.resistance
+        areal = math.fsum(d * w for d, w in zip(densities, widths))
+        self.density = areal / (p.thickness / 1000)
+        self.mass_unit = areal / nz      # kg/m² represented by one unit of inventory per cell
+        # Multiply a stored cell inventory by rho_unit to recover kg per original m³.
+        self.rho_unit = tuple(self.mass_unit / w for w in widths for _ in range(nx))
+        self.weights = tuple(d * w / self.mass_unit for d, w in zip(densities, widths) for _ in range(nx))
+        self.initial = tuple(tuple(f * weight for f in fs) for fs, weight in
+                             zip((fs for fs in stocks for _ in range(nx)), self.weights))
+        self.temperatures = tuple(t for t in temperatures for _ in range(nx))
+
+    def interface_values(self, temperature, states):
+        readings = []
+        for face in self.interfaces:
+            i = face.cell
+            a = self.widths[i] / (2 * states[i].conductivity)
+            b = self.widths[i + 1] / (2 * states[i + 1].conductivity)
+            q = (temperature[i] - temperature[i + 1]) / (a + face.resistance + b)
+            readings.append((temperature[i] - q * a - KELVIN, temperature[i + 1] + q * b - KELVIN, q))
+        return tuple(readings)
+
+
+@dataclass(frozen=True)
 class ReactionNetwork:
     components: tuple[Component, ...]
     reactions: tuple[NetworkReaction, ...]
@@ -1088,6 +1176,7 @@ class ReactionNetwork:
     gas_species: tuple[GasSpecies, ...] = ()
     slab_porosity: float = 30.0  # fixed connected pore volume in 1D, %
     slab_vent: str = "front"    # 2D uses SectionParameters instead
+    layers: tuple[MaterialLayer, ...] = ()
 
     @property
     def names(self):
@@ -1098,7 +1187,7 @@ class ReactionNetwork:
         return tuple(g.name for g in self.gas_species)
 
     def validate(self):
-        if not self.components or not self.reactions:
+        if not self.components or (not self.reactions and not self.layers):
             raise ValueError("至少需要一个凝聚相组分和一条反应。")
         seen = set()
         for row, item in enumerate(self.components, 1):
@@ -1110,7 +1199,7 @@ class ReactionNetwork:
             if not 0 <= item.initial <= 1:
                 raise ValueError(f"组分第 {row} 行初始质量分数须为 0–1。")
         total = math.fsum(item.initial for item in self.components)
-        if abs(total - 1) > 1e-9:
+        if not self.layers and abs(total - 1) > 1e-9:
             raise ValueError(f"初始质量分数之和为 {total:.10g}，应为 1。")
         if not math.isfinite(self.reference_temperature) or self.reference_temperature <= 0:
             raise ValueError("热物性参考温度必须是大于 0 的开尔文温度。")
@@ -1119,6 +1208,25 @@ class ReactionNetwork:
                 raise ValueError("热物性表须为每种凝聚相组分填写且只填写一行，包括初始质量为 0 的产物。")
             for material in self.materials:
                 material.validate()
+        layer_names = set()
+        for i, layer in enumerate(self.layers, 1):
+            if (not isinstance(layer.name, str) or not layer.name or not layer.name.isprintable()
+                    or layer.name != layer.name.strip() or layer.name in layer_names):
+                raise ValueError(f"第 {i} 层名称为空、含无效字符或重复。")
+            layer_names.add(layer.name)
+            if not math.isfinite(layer.thickness) or layer.thickness <= 0:
+                raise ValueError(f"第 {i} 层厚度须为有限正数（mm）。")
+            if (len(layer.fractions) != len(self.components) or any(not 0 <= w <= 1 for w in layer.fractions)
+                    or abs(math.fsum(layer.fractions) - 1) > 1e-9):
+                raise ValueError(f"第 {i} 层的各组分质量分数须为 0–1，合计为 1。")
+            if not math.isfinite(layer.contact) or layer.contact < 0 or (i == len(self.layers) and layer.contact != 0):
+                raise ValueError(f"第 {i} 层的接触热阻须为有限非负数，最后一层请填 0。")
+            if layer.initial_temperature is not None and not 1 < layer.initial_temperature + KELVIN < 3000:
+                raise ValueError(f"第 {i} 层初温超出模型范围（1–3000 K），请用 °C 填写。")
+        try:
+            math.fsum(layer.thickness for layer in self.layers)
+        except OverflowError as error:
+            raise ValueError("各层总厚度超出数值范围。") from error
         gas_names = set()
         for g in self.gas_species:
             if (not isinstance(g.name, str) or not g.name or not g.name.isprintable() or g.name != g.name.strip()
@@ -1188,7 +1296,8 @@ class ReactionChannel:
 
 class ReactionGrid:
     """Per-cell inventory and competitive condensed-phase reaction extents."""
-    def __init__(self, network, count, *, density=None, pore_fraction=None, diffusivity=DEFAULT_GAS_DIFFUSIVITY):
+    def __init__(self, network, count, *, density=None, pore_fraction=None, diffusivity=DEFAULT_GAS_DIFFUSIVITY,
+                 mesh=None):
         network.validate()
         indices = {name: i for i, name in enumerate(network.names)}
         groups = {}
@@ -1215,12 +1324,19 @@ class ReactionGrid:
                                             r.yield_pct / 100, r.absorbed_per_kg(), indices.get(r.catalyst),
                                             r.catalyst_strength, yields))
         self.groups = [(source, sorted(shapes.items())) for source, shapes in groups.items()]
-        total = math.fsum(item.initial for item in network.components)
-        initial = [item.initial / total for item in network.components]
-        self.mass = [initial.copy() for _ in range(count)]
-        self.virgin = [initial.copy() for _ in range(count)]
+        if network.layers and mesh is None:
+            p = SlabParameters() if density is None else SlabParameters(density=density)
+            mesh = LayerMesh(network, p, count)
+        if mesh is None:
+            total = math.fsum(item.initial for item in network.components)
+            initial = [item.initial / total for item in network.components]
+            self.mass = [initial.copy() for _ in range(count)]
+        else:
+            self.mass = [list(row) for row in mesh.initial]
+            density = mesh.density
+        self.virgin = [row.copy() for row in self.mass]
         # Available + ever consumed = initial stock + cumulative production, even for cycles.
-        self.spent = [[0.0] * len(initial) for _ in range(count)] if history else None
+        self.spent = [[0.0] * len(network.components) for _ in range(count)] if history else None
         self.gases = None
         if network.gas_species:
             if density is None:
@@ -1228,7 +1344,7 @@ class ReactionGrid:
                            if network.materials else SlabParameters().density)
             if pore_fraction is None:
                 pore_fraction = network.slab_porosity / 100
-            self.gases = PoreGasGrid(network.gas_species, count, density, pore_fraction, diffusivity)
+            self.gases = PoreGasGrid(network.gas_species, count, density, pore_fraction, diffusivity, mesh)
 
     def advance(self, cell, temperature, dt):
         mass, virgin = self.mass[cell], self.virgin[cell]
@@ -1340,16 +1456,29 @@ class CellThermal:
 
 class SolidMixture:
     """Bulk species properties on the prescribed material grid."""
-    def __init__(self, model, initial_t):
+    def __init__(self, model, initial_t, mesh=None, parameters=None):
+        self.mesh = mesh
+        self.constant = None
+        if mesh and not model.materials:
+            p = parameters
+            self.constant = CellThermal(initial_t, (), p.density * p.heat_capacity, p.conductivity, p.emissivity)
+            self.initial_density = mesh.density
+            return
         by_name = {m.name: m for m in model.materials}
         self.materials = tuple(by_name[name] for name in model.names)
         self.tr = model.reference_temperature
+        if mesh:
+            self.initial_density = mesh.density
+            return
         total = sum(c.initial for c in model.components)
         self.initial_density = total / sum(
             c.initial / m.bulk_density(initial_t, self.tr) for c, m in zip(model.components, self.materials))
 
-    def cell(self, mass, temperature, stretch):
-        active = tuple((m, self.initial_density * w) for m, w in zip(self.materials, mass) if w > 0)
+    def cell(self, mass, temperature, stretch, i=0):
+        if self.constant is not None:
+            return self.constant
+        density = self.mesh.rho_unit[i] if self.mesh else self.initial_density
+        active = tuple((m, density * w) for m, w in zip(self.materials, mass) if w > 0)
         volumes = [w / m.bulk_density(temperature, self.tr) for m, w in active]
         occupied = sum(volumes)
         # Species densities are bulk densities, already including their internal pores.
@@ -1366,17 +1495,24 @@ class SolidMixture:
         if absorbed == 0:
             return t, gas, original, 0.0
         midpoint = [(a + b) / 2 for a, b in zip(before, grid.mass[i])]
-        state = self.cell(midpoint, t, stretch)
-        temperature, balance = state.temperature_after(t, -absorbed * self.initial_density)
+        state = self.cell(midpoint, t, stretch, i)
+        density = self.mesh.rho_unit[i] if self.mesh else self.initial_density
+        temperature, balance = state.temperature_after(t, -absorbed * density)
         return temperature, gas, original, balance
 
 
-def material_heat_line(temperature, states, line, dt_ref, spacing, boundaries):
+def material_heat_line(temperature, states, line, dt_ref, spacing, boundaries, widths=(), contacts=()):
     """Backward Euler in sensible enthalpy, with fixed conductances for this sweep."""
     old = [temperature[i] for i in line]
     cells = [states[i] for i in line]
     factor = dt_ref / spacing**2
-    links = [factor * 2 / (1 / a.conductivity + 1 / b.conductivity) for a, b in zip(cells, cells[1:])]
+    weights = [width / spacing for width in widths] if widths else [1.0] * len(cells)
+    if widths:
+        links = [dt_ref / spacing / (widths[j] / (2 * a.conductivity) + contacts[j]
+                                     + widths[j + 1] / (2 * b.conductivity))
+                 for j, (a, b) in enumerate(zip(cells, cells[1:]))]
+    else:
+        links = [factor * 2 / (1 / a.conductivity + 1 / b.conductivity) for a, b in zip(cells, cells[1:])]
     off = [-g for g in links]
     diagonal = [l + r for l, r in zip([0.0, *links], [*links, 0.0])]
     faces = []
@@ -1386,7 +1522,7 @@ def material_heat_line(temperature, states, line, dt_ref, spacing, boundaries):
         faces.append((j, coeff * sink, coeff * source))
 
     def residual(values):
-        out = [cell.energy(a, b) for cell, a, b in zip(cells, old, values)]
+        out = [w * cell.energy(a, b) for w, cell, a, b in zip(weights, cells, old, values)]
         for j, g in enumerate(links):
             transfer = g * (values[j] - values[j + 1])
             out[j] += transfer
@@ -1398,14 +1534,17 @@ def material_heat_line(temperature, states, line, dt_ref, spacing, boundaries):
     trial = old
     errors = residual(trial)
     initial_norm = max(map(abs, errors))
-    tolerance = 5e-7 + 1e-11 * initial_norm
+    # A representable temperature change of one ULP limits the attainable residual on thin cells.
+    roundoff = max(math.ulp(t) * (2*d + w*cell.capacity(t))
+                   for t, d, w, cell in zip(trial, diagonal, weights, cells))
+    tolerance = max(5e-7 + 1e-11 * initial_norm, 4 * roundoff)
     for _ in range(40):
         norm = max(map(abs, errors))
         if norm <= tolerance:
             for i, value in zip(line, trial):
                 temperature[i] = value
             return sum(errors)
-        tangent = [d + cell.capacity(t) for d, cell, t in zip(diagonal, cells, trial)]
+        tangent = [d + w * cell.capacity(t) for d, w, cell, t in zip(diagonal, weights, cells, trial)]
         change = tridiagonal_solve(tangent, [-e for e in errors], off, off)
         # A Newton step may jump across a narrow melting peak. Backtrack on the
         # actual energy residual until it falls, retaining the positive-K domain.
@@ -1426,13 +1565,15 @@ def material_heat_line(temperature, states, line, dt_ref, spacing, boundaries):
 def material_heat_step(mixture, mass, temperature, scale, rows, columns, dt, dx, dz0,
                        p, flux, front, back):
     """Shared x/z heat update. In 1D the x sweep is omitted."""
-    states = [mixture.cell(m, t, scale) for m, t in zip(mass, temperature)]
+    states = [mixture.cell(m, t, scale, i) for i, (m, t) in enumerate(zip(mass, temperature))]
     dt_ref = dt * scale  # storage is measured per initial volume
     for line in rows:
         material_heat_line(temperature, states, line, dt_ref, dx, ())
     ambient = p.ambient + KELVIN
     dz = dz0 * scale
     balance = 0.0
+    widths = tuple(w * scale for w in mixture.mesh.widths) if mixture.mesh else ()
+    contacts = mixture.mesh.contacts if mixture.mesh else ()
     surface_terms = []
     for column_index, line in enumerate(columns):
         boundaries = []
@@ -1442,12 +1583,12 @@ def material_heat_step(mixture, mass, temperature, scale, rows, columns, dt, dx,
             t = face[column_index]
             radiation = STEFAN_BOLTZMANN * states[i].emissivity * (t + ambient) * (t*t + ambient*ambient)
             h += radiation
-            resistance = dz / (2 * states[i].conductivity)
+            resistance = (widths[j] if widths else dz) / (2 * states[i].conductivity)
             factor = 1 + h * resistance
             sink, source = h / factor, (applied + h * ambient) / factor
             boundaries.append((j, sink, source))
             surface_terms.append((face, column_index, i, resistance, sink, source))
-        balance += material_heat_line(temperature, states, line, dt_ref, dz, boundaries)
+        balance += material_heat_line(temperature, states, line, dt_ref, dz, boundaries, widths, contacts)
     return balance, surface_terms
 
 
@@ -1635,13 +1776,14 @@ def slab_simulate_materials(p, model, cancelled, profiles):
     dz = p.thickness / (1000 * count)
     ambient = p.ambient + KELVIN
     model.validate()
-    mixture = SolidMixture(model, ambient)
-    grid = ReactionGrid(model, count, density=mixture.initial_density)
+    mesh = LayerMesh(model, p, count) if model.layers else None
+    mixture = SolidMixture(model, ambient, mesh, p)
+    grid = ReactionGrid(model, count, density=mixture.initial_density, mesh=mesh)
     balances = grid.gases.balances() if grid.gases else ()
     cell_mass = mixture.initial_density * dz
-    depths = (0.0, *(p.thickness * (i + .5) / count for i in range(count)), p.thickness)
-    temperature = [ambient] * count
-    front, back = [ambient], [ambient]
+    depths = mesh.depths if mesh else (0.0, *(p.thickness * (i + .5) / count for i in range(count)), p.thickness)
+    temperature = list(mesh.temperatures) if mesh else [ambient] * count
+    front, back = [temperature[0]], [temperature[-1]]
     columns, flux = (range(count),), (p.flux * 1000,)
     sample_every = max(1, math.ceil(steps / 1500))
     generated = peak = mass_error = energy_error = 0.0
@@ -1651,15 +1793,20 @@ def slab_simulate_materials(p, model, cancelled, profiles):
         for i, t in enumerate(temperature):
             temperature[i], released, _, error = mixture.react(grid, i, t, dt / 2, 1.0)
             gas += released
-            balance += error
+            balance += error * (mesh.widths[i] / dz if mesh else 1)
         return gas, balance
 
     def frame(time, rate):
         solids = tuple(100 * sum(part) / count for part in zip(*grid.mass))
         values = (front[0] - KELVIN, *(t - KELVIN for t in temperature), back[0] - KELVIN) if profiles else ()
-        residue = tuple(100 * sum(m) for m in grid.mass) if profiles else ()
+        residue = tuple(100 * sum(m) / (mesh.weights[i] if mesh else 1)
+                        for i, m in enumerate(grid.mass)) if profiles else ()
+        faces = ()
+        if profiles and mesh and mesh.interfaces:
+            states = [mixture.cell(m, t, 1.0, i) for i, (m, t) in enumerate(zip(grid.mass, temperature))]
+            faces = mesh.interface_values(temperature, states)
         return SlabFrame(time, front[0] - KELVIN, back[0] - KELVIN, values, residue, sum(solids),
-                         rate, (*solids, 100 * generated / count), balances)
+                         rate, (*solids, 100 * generated / count), balances, faces)
 
     frames = [frame(0, 0)]
     for index in range(1, steps + 1):
@@ -1682,7 +1829,8 @@ def slab_simulate_materials(p, model, cancelled, profiles):
         energy_error = max(energy_error, abs(error1 + error_t + error2) * dz)
         if index % sample_every == 0 or index == steps:
             frames.append(frame(index * dt, rate))
-    return SlabResult(depths, tuple(frames), peak, mass_error, energy_error, model.names, model.gas_names)
+    return SlabResult(depths, tuple(frames), peak, mass_error, energy_error, model.names, model.gas_names,
+                      mesh.interfaces if mesh else ())
 
 
 def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=True):
@@ -1696,7 +1844,7 @@ def slab_simulate(parameters, kinetics, cancelled=lambda: False, *, profiles=Tru
     if isinstance(kinetics, SlabMechanism):
         return slab_simulate_multistep(parameters, kinetics, cancelled, profiles)
     validate_slab(parameters)
-    if isinstance(kinetics, ReactionNetwork) and kinetics.materials:
+    if isinstance(kinetics, ReactionNetwork) and (kinetics.materials or kinetics.layers):
         return slab_simulate_materials(parameters, kinetics, cancelled, profiles)
     p = parameters
     count = int(p.cells)
@@ -1840,10 +1988,13 @@ def export_slab(path, result):
         writer.writerow(["time_s", "front_C", "back_C", "remaining_mass_pct", "mass_loss_g_m2_s"] +
                         [f"T_C_at_z_{depth:.6f}_mm" for depth in result.depth_mm[1:-1]] +
                         [f"solid_mass_pct_at_z_{depth:.6f}_mm" for depth in result.depth_mm[1:-1]] +
-                        composition_columns + gas_csv_headers(result.gas_names))
+                        composition_columns + gas_csv_headers(result.gas_names) +
+                        [f"interface_{j}_at_{face.depth:.6g}_mm_{field}" for j, face in enumerate(result.interfaces, 1)
+                         for field in ("front_C", "back_C", "heat_flux_W_m2")])
         for frame in result.frames:
             values = (frame.time, frame.front, frame.back, frame.remaining_mass, frame.loss_rate,
-                      *frame.temperature[1:-1], *frame.residual, *frame.composition, *gas_csv_values(frame.gas_balance))
+                      *frame.temperature[1:-1], *frame.residual, *frame.composition, *gas_csv_values(frame.gas_balance),
+                      *(v for face in frame.interface_values for v in face))
             writer.writerow([f"{value:.7f}" for value in values])
 
 
@@ -1853,6 +2004,8 @@ SLAB_HELP = """一维平板 · 惰性气氛
 「组分与反应表」可设置各凝聚相组分的初始质量分数。每条反应可选择动力学模型 0–9，并为适用的模型填写级数 n。点击「定位动力学列」可跳到这些输入框，「模型公式」可查看各编号对应的速率函数。局部转化率等于该组分累计消耗量除以其初始量与累计生成量之和。To 为凝聚相时其产率按消耗质量的百分比填写，余量归入 gases。有效热按消耗量计（kJ/kg）。用分项热时，ΔHsol 和 ΔHvol 分别按生成的凝聚相产物、挥发物质量计（J/kg），正值吸热。
 
 「组分热物性」可逐行设置参考密度、比热、导热和发射率，各组分使用同一个开尔文参考温度。可选温度幂指数、孔隙辐射导热和熔化吸热峰。比热按质量加权，导热和表面发射率按组分体积加权。表为空时共用平板热物性。在整体组分视图中可选组分或凝聚相的累计净挥发量 gases。
+
+「材料分层」按从受热面到背面的顺序填写各层厚度（mm）、初温（°C）、与下一层的接触热阻（m²·K/W）及本层质量分数。改变层厚时平板厚度同步为各层之和，之后单独修改平板厚度时各层按比例缩放。厚向网格至少每层一个，界面位于两个单元之间。「温度剖面」可见界面两侧温度，「层间热流」正值指向背面。在界面深度设置测点时返回受热侧温度。分层试样可将反应表留空做纯导热。
 
 「气体组分」填写每种气体的扩散系数、初始孔内浓度与开放面外界浓度。「气体产率矩阵」每行对应一条反应，每列对应一种气体，数值按每 kg 净挥发量计。正数为生成，负数为消耗。局部缺少所需气体时，反应消耗的固体、生成的各产物和反应热同步减少。点击「气体质量收支」并选择气体，可查看累计生成、累计消耗、当前孔内质量和两面的累计净排出。各量均以初始干样质量为 100%，正通量流出，负通量流入。一维使用固定的连通孔隙率。
 
@@ -1867,6 +2020,104 @@ SLAB_HELP = """一维平板 · 惰性气氛
 算例保存设置、测点、视图，以及与当前参数一致的计算结果。重新打开单步算例时，同步恢复主窗口中供平板使用的三个热解参数。
 
 示例为合成参数。改变网格和步长可比较结果的数值收敛性。实际实验需用实测温度和质量损失验证参数及边界。"""
+
+
+class LayerTable:
+    def __init__(self, editor, layers):
+        self.editor = editor
+        tk, ttk = editor.tk, editor.ttk
+        self.panel = ttk.Frame(editor.tabs, padding=8)
+        editor.tabs.add(self.panel, text="材料分层")
+        editor.slab.lab.text(self.panel, "从受热面到背面每层填一行。厚度用 mm，初温留空取环境温度。"
+                             "热阻填本层与下一层之间的面积热阻，单位 m²·K/W，最后一层填 0。"
+                             "各组分列填本层初始质量分数，合计为 1。",
+                             bg=BG, fg=MUTED, wraplength=700, justify="left").pack(anchor="w")
+        actions = ttk.Frame(self.panel)
+        actions.pack(fill="x", pady=5)
+        ttk.Button(actions, text="添加材料层", command=self.add).pack(side="left")
+        ttk.Button(actions, text="粘贴分层表", command=self.paste).pack(side="left", padx=6)
+        self.grid, _ = editor.scroll_grid(self.panel)
+        self.rows = []
+        self.signature = None
+        for layer in layers:
+            values = (layer.name, layer.thickness, layer.initial_temperature, layer.contact, *layer.fractions)
+            self.add(values, redraw=False)
+        self.refresh()
+
+    def components(self):
+        return [r[0] for r in self.editor.rows["components"]]
+
+    def add(self, values=(), redraw=True):
+        def variable(v):
+            return self.editor.tk.StringVar(master=self.panel, value="" if v is None else str(v))
+        fixed = [variable(values[i] if i < len(values) else None) for i in range(4)]
+        fractions = {entry: variable(v) for entry, v in zip(self.components(), values[4:])}
+        self.rows.append((fixed, fractions))
+        self.signature = None
+        if redraw:
+            self.refresh()
+
+    def move(self, index, step):
+        row = self.rows.pop(index)
+        if step:
+            self.rows.insert(index + step, row)
+        self.signature = None
+        self.refresh()
+
+    def refresh(self):
+        components = self.components()
+        signature = tuple((entry, entry.get()) for entry in components)
+        if signature == self.signature:
+            return
+        self.signature = signature
+        tk, ttk = self.editor.tk, self.editor.ttk
+        for widget in self.grid.winfo_children():
+            widget.destroy()
+        labels = ("层名", "厚度 (mm)", "初温 (°C)", "后界面热阻", *(entry.get() or "未命名组分" for entry in components))
+        for col, label in enumerate(labels):
+            ttk.Label(self.grid, text=label).grid(row=0, column=col, sticky="w", padx=3)
+        for i, (fixed, fractions) in enumerate(self.rows):
+            for key in list(fractions):
+                if key not in components:
+                    del fractions[key]
+            for entry in components:
+                if entry not in fractions:
+                    fractions[entry] = tk.StringVar(master=self.panel)
+            variables = [*fixed, *(fractions[e] for e in components)]
+            for col, var in enumerate(variables):
+                ttk.Entry(self.grid, width=12, textvariable=var).grid(row=i+1, column=col, padx=3, pady=2)
+            actions = ttk.Frame(self.grid)
+            actions.grid(row=i+1, column=len(variables))
+            for label, step, enabled in (("上移", -1, i > 0), ("下移", 1, i+1 < len(self.rows)), ("删除", 0, True)):
+                ttk.Button(actions, text=label, width=4, state="normal" if enabled else "disabled",
+                           command=lambda idx=i, d=step: self.move(idx, d)).pack(side="left")
+
+    def paste(self):
+        count = len(self.components())
+        try:
+            lines = [line.split("\t") for line in self.panel.clipboard_get().splitlines() if line.strip()]
+        except self.editor.tk.TclError:
+            lines = []
+        if not count or not lines or any(len(line) != 4 + count for line in lines):
+            self.editor.status.set(f"请先定义凝聚相组分，再复制层名、厚度、初温、后界面热阻及 {count} 列质量分数。")
+            return
+        for values in lines:
+            self.add([v.strip() for v in values], redraw=False)
+        self.refresh()
+        self.editor.status.set(f"已追加 {len(lines)} 层。")
+
+    def read(self):
+        self.refresh()
+        layers = []
+        for i, (fixed, fractions) in enumerate(self.rows, 1):
+            name, thickness, initial, contact = [v.get().strip() for v in fixed]
+            try:
+                weights = tuple(float(fractions[e].get().strip() or 0) for e in self.components())
+                layers.append(MaterialLayer(name, float(thickness), weights, float(contact or 0),
+                                            float(initial) if initial else None))
+            except ValueError as error:
+                raise ValueError(f"第 {i} 层的厚度、初温、热阻或质量分数含无效数值。") from error
+        return tuple(layers)
 
 
 class ReactionTableEditor:
@@ -1898,7 +2149,7 @@ class ReactionTableEditor:
         self.matrix_signature = None
         for key, title, hint, labels in (
             ("components", "组分与初始质量分数",
-             "每行一个凝聚相组分。质量分数填 0–1，总和须为 1。只作为产物出现的组分填 0。",
+             "每行一个凝聚相组分。均匀试样的初始质量分数合计为 1。分层试样在「材料分层」中逐层填，这里的质量分数可留空。",
              ("组分名称", "初始质量分数")),
             ("reactions", "From → To 反应",
              "To 为 gases 时凝聚相产率填 0%。有效热按每千克反应物填写。使用分项热时留空有效热，"
@@ -1962,6 +2213,7 @@ class ReactionTableEditor:
             for row, reaction in zip(self.rows["reactions"], model.reactions):
                 for col, value in zip(self.rows["gas_species"], reaction.gas_yields):
                     self.yield_vars[row[0], col[0]].set(str(value))
+        self.layer_table = LayerTable(self, model.layers if isinstance(model, ReactionNetwork) else ())
         self.tabs.bind("<<NotebookTabChanged>>", self.table_changed)
 
     def scroll_grid(self, panel):
@@ -1989,6 +2241,8 @@ class ReactionTableEditor:
     def table_changed(self, _event):
         if self.tabs.select() == str(self.matrix_panel):
             self.refresh_matrix()
+        elif self.tabs.select() == str(self.layer_table.panel):
+            self.layer_table.refresh()
 
     def refresh_matrix(self):
         reactions, gases = self.rows["reactions"], self.rows["gas_species"]
@@ -2122,6 +2376,9 @@ class ReactionTableEditor:
             values = [field.get().strip() for field in widgets[:-1]]
             numbers = []
             for value, spec in zip(values[text_columns:], fields(cls)[text_columns:]):
+                if not value and key == "components" and self.layer_table.rows:
+                    numbers.append(0.0)
+                    continue
                 if not value and spec.default is not MISSING:
                     numbers.append(spec.default)
                     continue
@@ -2144,6 +2401,13 @@ class ReactionTableEditor:
                 tr = float(self.reference.get())
             except ValueError as error:
                 raise ValueError("请输入开尔文参考温度 Tr。") from error
+            layers = self.layer_table.read()
+            if layers:
+                # A new table includes one empty default reaction, including its preset kinetics.
+                for widgets in self.rows["reactions"][:]:
+                    values = [w.get().strip() for w in widgets[:-1]]
+                    if not any(values[:8] + values[10:]) and values[8:] == [self.MODEL_CHOICES[0], "1", "", ""]:
+                        self.remove("reactions", widgets)
             gases = self.read_rows("gas_species", GasSpecies, 1)
             self.refresh_matrix()
             reactions = []
@@ -2159,8 +2423,17 @@ class ReactionTableEditor:
                 raise ValueError("请输入一维连通孔隙率（%）。") from error
             vent = next(k for k, label in VENTS.items() if self.gas_vent.get() == label)
             network = ReactionNetwork(self.read_rows("components", Component, 1), tuple(reactions),
-                                      self.read_rows("materials", SpeciesThermal, 1), tr, gases, porosity, vent)
+                                      self.read_rows("materials", SpeciesThermal, 1), tr, gases, porosity, vent, layers)
             network.validate()
+            previous = self.slab.mechanism
+            old_widths = tuple(l.thickness for l in previous.layers) if isinstance(previous, ReactionNetwork) else ()
+            widths = tuple(l.thickness for l in layers)
+            if widths and widths != old_widths:
+                thickness = math.fsum(widths)
+                _, _, _, low, high = next(f for f in SLAB_FIELDS if f[0] == "thickness")
+                if not low <= thickness <= high:
+                    raise ValueError(f"各层总厚度应在 {low:g}–{high:g} mm 内。")
+                self.slab.inputs["thickness"].set(f"{thickness:.12g}")
         except ValueError as error:
             self.status.set(str(error))
             return
@@ -2337,7 +2610,8 @@ def read_experiment(path, parameters):
 def default_thermal_keys(kinetics):
     prefix = ""
     if isinstance(kinetics, ReactionNetwork) and kinetics.materials:
-        dominant = max(kinetics.components, key=lambda component: component.initial).name
+        initial = (kinetics.layers[0].fractions if kinetics.layers else tuple(c.initial for c in kinetics.components))
+        dominant = kinetics.names[max(range(len(initial)), key=initial.__getitem__)]
         index = next(i for i, row in enumerate(kinetics.materials) if row.name == dominant)
         prefix = f"m{index}."
     return (prefix + "conductivity", prefix + "heat_capacity")
@@ -2357,6 +2631,9 @@ def inverse_fields(kinetics):
                     current = getattr(material, key)
                     fields.append((f"m{i}.{key}", f"{material.name} · {label}",
                                    min(low, current / 2), max(high, current * 2)))
+        for i, (left, right) in enumerate(zip(kinetics.layers, kinetics.layers[1:])):
+            fields.append((f"layer{i}.contact", f"{left.name} → {right.name} · 接触热阻 (m²·K/W)",
+                           0.0, max(.05, 4 * left.contact)))
         for i, reaction in enumerate(kinetics.reactions):
             prefix = f"反应 {i + 1} · {reaction.source} → {reaction.target}"
             fields.extend(((f"{i}.energy", prefix + " · E (kJ/mol)", 0, max(500, reaction.energy * 2)),
@@ -2386,6 +2663,8 @@ def inverse_value(parameters, kinetics, key):
     if "." in key:
         side, field = key.split(".")
         if isinstance(kinetics, ReactionNetwork):
+            if side.startswith("layer"):
+                return kinetics.layers[int(side[5:])].contact
             if side.startswith("m"):
                 return getattr(kinetics.materials[int(side[1:])], field)
             reaction = kinetics.reactions[int(side)]
@@ -2405,9 +2684,14 @@ def with_inverse_values(parameters, kinetics, keys, values):
     if isinstance(kinetics, ReactionNetwork):
         rows = list(kinetics.reactions)
         materials = list(kinetics.materials)
+        layers = list(kinetics.layers)
         for key, value in selected.items():
             if "." in key:
                 index, field = key.split(".")
+                if index.startswith("layer"):
+                    i = int(index[5:])
+                    layers[i] = replace(layers[i], contact=value)
+                    continue
                 if index.startswith("m"):
                     i = int(index[1:])
                     materials[i] = replace(materials[i], **{field: value})
@@ -2415,7 +2699,7 @@ def with_inverse_values(parameters, kinetics, keys, values):
                 i = int(index)
                 change = {"prefactor": 10 ** value} if field == "log_z" else {field: value}
                 rows[i] = replace(rows[i], **change)
-        kinetics = replace(kinetics, reactions=tuple(rows), materials=tuple(materials))
+        kinetics = replace(kinetics, reactions=tuple(rows), materials=tuple(materials), layers=tuple(layers))
     elif isinstance(kinetics, SlabMechanism):
         replacements = {}
         for side in ("first", "second"):
@@ -3209,6 +3493,8 @@ class SectionResult:
     frames: tuple[SectionFrame, ...]
     mass_error: float         # max balance error normalized by initial dry mass
     gas_names: tuple[str, ...] = ()
+    depth_edges: tuple[float, ...] = ()  # relative to current thickness
+    layer_names: tuple[str, ...] = ()   # one per depth row
 
 
 def section_sweep(values, capacity, mobility, lines, dt, spacing, boundary):
@@ -3236,14 +3522,18 @@ def section_sweep(values, capacity, mobility, lines, dt, spacing, boundary):
 
 class PoreGasGrid:
     """Species stocks per initial dry-solid mass. Positive face fluxes point outward."""
-    def __init__(self, species, count, density, pore_fraction, shared_diffusivity):
+    def __init__(self, species, count, density, pore_fraction, shared_diffusivity, mesh=None):
+        self.mesh = mesh
         self.species = species
         self.count = count
         self.density = density
         self.pore_fraction = pore_fraction
         self.diffusivities = tuple(shared_diffusivity if g.diffusivity is None else g.diffusivity for g in species)
         self.initial = tuple(g.initial_concentration * pore_fraction / density for g in species)
-        self.mass = [[initial] * count for initial in self.initial]
+        if mesh:
+            self.mass = [[g.initial_concentration * pore_fraction / rho for rho in mesh.rho_unit] for g in species]
+        else:
+            self.mass = [[initial] * count for initial in self.initial]
         self.produced = [0.0] * len(species)  # summed across cells; divide by count for a sample average
         self.consumed = [0.0] * len(species)
         self.front = [0.0] * len(species)     # integrated face flux per initial sample mass
@@ -3276,34 +3566,54 @@ class PoreGasGrid:
                                   for initial, b in zip(self.initial, balances)))
 
     def concentrations(self, pores, scale):
-        factors = [self.density / (f * scale) for f in pores]
+        densities = self.mesh.rho_unit if self.mesh else [self.density] * self.count
+        factors = [rho / (f * scale) for rho, f in zip(densities, pores)]
         return tuple(tuple(m * rho for m, rho in zip(stock, factors)) for stock in self.mass)
 
     def transport_slab(self, dt, dz, vent):
         self.transport([self.pore_fraction] * self.count, 1.0, dt, dz, dz, (), (range(self.count),), vent)
 
     def transport(self, pores, scale, dt, dx, dz0, rows, columns, vent):
-        dz = dz0 * scale
-        rho = self.density / scale
-        weight = dt / (self.count * rho)
+        if self.mesh:
+            widths = [w * scale for w in self.mesh.widths]
+            local_rho = [rho / scale for rho in self.mesh.rho_unit]
+            mass_unit = self.mesh.mass_unit
+        else:
+            widths = [dz0 * scale] * len(columns[0])
+            local_rho = [self.density / scale] * self.count
+            mass_unit = self.density * dz0
+        active_faces = [(z, total) for z, side, total in ((0, "front", self.front), (-1, "back", self.back))
+                        if vent in (side, "both")]
         for j, (stock, species, diffusivity) in enumerate(zip(self.mass, self.species, self.diffusivities)):
             outside = species.ambient_concentration
-            if not diffusivity or (not any(stock) and (not outside or vent == "closed")):
+            if not diffusivity or (not any(stock) and (not outside or not active_faces)):
                 continue
-            concentration = [m * rho / f for m, f in zip(stock, pores)]
+            concentration = [m * rho / f for m, rho, f in zip(stock, local_rho, pores)]
             mobility = [diffusivity * f ** 1.5 for f in pores]
             section_sweep(concentration, pores, mobility, rows, dt, dx, {})
-            boundary = {}
             for col in columns:
-                for i, side in ((col[0], "front"), (col[-1], "back")):
-                    coeff = 2 * mobility[i] / dz**2 if vent in (side, "both") else 0.0
-                    boundary[i] = (coeff, coeff * outside)
-            section_sweep(concentration, pores, mobility, columns, dt, dz, boundary)
-            for i, (f, c) in enumerate(zip(pores, concentration)):
-                stock[i] = f * c / rho
-            for face, total in ((0, self.front), (-1, self.back)):
-                total[j] += weight * math.fsum(boundary[col[face]][0] * (concentration[col[face]] - outside)
-                                               for col in columns)
+                # Storage and flux coefficients per unit cross-sectional area.
+                storage = [pores[i] * w for i, w in zip(col, widths)]
+                diagonal = storage.copy()
+                rhs = [v * concentration[i] for v, i in zip(storage, col)]
+                off = []
+                for z, (i, k) in enumerate(zip(col, col[1:])):
+                    link = (2 * dt / (widths[z] / mobility[i] + widths[z+1] / mobility[k])
+                            if mobility[i] and mobility[k] else 0.0)
+                    off.append(-link)
+                    diagonal[z] += link
+                    diagonal[z+1] += link
+                faces = []
+                for z, total in active_faces:
+                    link = 2 * dt * mobility[col[z]] / widths[z]
+                    diagonal[z] += link
+                    rhs[z] += link * outside
+                    faces.append((z, link, total))
+                solved = tridiagonal_solve(diagonal, rhs, off, off)
+                for i, c in zip(col, solved):
+                    stock[i] = pores[i] * c / local_rho[i]
+                for z, link, total in faces:
+                    total[j] += link * (solved[z] - outside) / (self.count * mass_unit)
 
 
 def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False, report=lambda n: None):
@@ -3344,22 +3654,24 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
     flux = [1000 * p.flux * max(0.0, min(i + 1, exposed_right) - max(i, exposed_left))
             for i in range(nx)]
     ambient = p.ambient + KELVIN
-    mixture = SolidMixture(model, ambient) if model and model.materials else None
+    mesh = LayerMesh(model, p, nz, nx) if model and model.layers else None
+    mixture = SolidMixture(model, ambient, mesh, p) if model and (model.materials or mesh) else None
     initial_density = mixture.initial_density if mixture else p.density
     sigma = STEFAN_BOLTZMANN * p.emissivity
-    front, back = [ambient] * nx, [ambient] * nx
-    temperature = [ambient] * count
+    temperature = list(mesh.temperatures) if mesh else [ambient] * count
+    front, back = temperature[:nx], temperature[-nx:]
     raw, mid, char = [1.0] * count, [0.0] * count, [0.0] * count
     network = (ReactionGrid(model, count, density=initial_density, pore_fraction=s.porosity_raw / 100,
-                            diffusivity=s.diffusivity) if model else None)
+                            diffusivity=s.diffusivity, mesh=mesh) if model else None)
     named = network.gases if network else None
-    pore = named or PoreGasGrid((GasSpecies("gases"),), count, initial_density, s.porosity_raw / 100, s.diffusivity)
+    pore = named or PoreGasGrid((GasSpecies("gases"),), count, initial_density, s.porosity_raw / 100, s.diffusivity, mesh)
     balances = pore.balances()
     mass_error = 0.0
     every = max(1, math.ceil(steps / 160))
 
     def stretch():
-        return 1 + (s.end_thickness / 100 - 1) * (1 - sum(raw) / count)
+        remaining = sum(u * w for u, w in zip(raw, mesh.weights)) if mesh else sum(raw)
+        return 1 + (s.end_thickness / 100 - 1) * (1 - remaining / count)
 
     def pores():
         return [(s.porosity_raw * u + s.porosity_end * (1 - u)) / 100 for u in raw]
@@ -3386,7 +3698,7 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
                     temperature[i] -= absorbed / p.heat_capacity
                 if not named:
                     pore.mass[0][i] += released
-                raw[i] = max(0.0, raw[i] - consumed)
+                raw[i] = max(0.0, raw[i] - consumed / (mesh.weights[i] if mesh else 1))
             check_temperature()
             return
         if not (single or multi):
@@ -3440,11 +3752,13 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
         if network is None:
             residual = tuple(100 * (u + v + w) for u, v, w in zip(raw, mid, char))
         else:
-            residual = tuple(100 * sum(mass) for mass in network.mass)
+            residual = tuple(100 * sum(mass) / (mesh.weights[i] if mesh else 1)
+                             for i, mass in enumerate(network.mass))
+        overall = sum(w * r for w, r in zip(mesh.weights, residual)) / count if mesh else sum(residual) / count
         fields = pore.concentrations(pores(), scale)
         concentration = tuple(map(math.fsum, zip(*fields))) if named else fields[0]
         return SectionFrame(t, p.thickness * scale, tuple(value - KELVIN for value in temperature),
-                            residual, concentration, sum(residual) / count, sum(b.pore for b in balances),
+                            residual, concentration, overall, sum(b.pore for b in balances),
                             sum(b.front for b in balances), sum(b.back for b in balances),
                             balances if named else (), fields if named else ())
 
@@ -3479,7 +3793,8 @@ def section_simulate(p, kinetics, s=SectionParameters(), cancelled=lambda: False
         if percent != last_percent:
             report(percent)
             last_percent = percent
-    return SectionResult(s, tuple(frames), mass_error, model.gas_names if named else ())
+    return SectionResult(s, tuple(frames), mass_error, model.gas_names if named else (),
+                         tuple(z / p.thickness for z in mesh.edges) if mesh else (), mesh.names if mesh else ())
 
 
 def export_section(path, result, index=None):
@@ -3496,11 +3811,16 @@ def export_section(path, result, index=None):
         nx, nz = int(s.nx), int(s.nz)
         writer.writerow(("time_s", "x_center_mm", "z_center_mm", "thickness_mm", "temperature_C",
                          "local_solid_pct_initial", "gas_kg_per_m3_pore",
-                         *(f"gas_{name}_kg_per_m3_pore" for name in result.gas_names)))
+                         *(f"gas_{name}_kg_per_m3_pore" for name in result.gas_names),
+                         *(("layer",) if result.layer_names else ())))
+        edges = result.depth_edges or tuple(z/nz for z in range(nz+1))
         for i, (t, solid, concentration) in enumerate(zip(f.temperature, f.residual, f.concentration)):
             z, x = divmod(i, nx)
-            writer.writerow((f.time, (x + .5) * s.width / nx, (z + .5) * f.thickness / nz,
-                             f.thickness, t, solid, concentration, *(c[i] for c in f.gas_concentrations)))
+            name = result.layer_names[z] if result.layer_names else ""
+            label = "'" + name if name.lstrip().startswith(("=", "-", "+", "@")) else name
+            writer.writerow((f.time, (x + .5) * s.width / nx, (edges[z] + edges[z+1]) * f.thickness / 2,
+                             f.thickness, t, solid, concentration, *(c[i] for c in f.gas_concentrations),
+                             *((label,) if name else ())))
 
 
 SLAB_VIEWS = {
@@ -3513,10 +3833,11 @@ SLAB_VIEWS = {
     "probe_residual": "测点局部剩余质量",
     "composition": "整体组分",
     "gas_balance": "气体质量收支",
+    "interfaces": "层间热流",
 }
 PROFILES = {"profile", "residual_profile"}
 CASE_FORMAT = "pyro-ignition-lab/slab"
-CASE_VERSION = 4
+CASE_VERSION = 5
 CASE_MAX_BYTES = 32 * 1024 ** 2
 
 
@@ -3528,6 +3849,18 @@ def slab_probe(result, depth):
     right = max(1, min(len(grid) - 1, bisect.bisect_left(grid, depth)))
     left = right - 1
     fraction = (depth - grid[left]) / (grid[right] - grid[left])
+    for j, face in enumerate(result.interfaces):
+        if left == face.cell + 1:
+            # One-sided interpolation. At the interface itself use the side facing z = 0.
+            if abs(depth - face.depth) <= 4 * max(math.ulp(depth), math.ulp(face.depth)):
+                depth = face.depth
+            if depth <= face.depth:
+                w = (depth - grid[left]) / (face.depth - grid[left])
+                return tuple(((1-w) * f.temperature[left] + w * f.interface_values[j][0], f.residual[face.cell])
+                             for f in result.frames)
+            w = (depth - face.depth) / (grid[right] - face.depth)
+            return tuple(((1-w) * f.interface_values[j][1] + w * f.temperature[right], f.residual[face.cell + 1])
+                         for f in result.frames)
     # Temperature includes boundary values; local mass is cell-centered.
     last = len(grid) - 3
     before = max(0, min(last, left - 1))
@@ -3546,14 +3879,28 @@ def export_probe(path, result, depth):
             writer.writerow(f"{v:.8g}" for v in (frame.time, depth, temp, mass))
 
 
+def profile_points(result, frame):
+    """Yield depth, temperature, local solid and location, keeping both one-sided face values."""
+    faces = {face.cell + 1: (j, face) for j, face in enumerate(result.interfaces)}
+    mass = (frame.residual[0], *frame.residual, frame.residual[-1])
+    for i, (depth, t, remaining) in enumerate(zip(result.depth_mm, frame.temperature, mass, strict=True)):
+        yield depth, t, remaining, ("surface" if i in (0, len(mass)-1) else "cell")
+        if i in faces:
+            j, face = faces[i]
+            a, b, _ = frame.interface_values[j]
+            yield face.depth, a, remaining, f"interface_{j+1}_front"
+            yield face.depth, b, mass[i+1], f"interface_{j+1}_back"
+
+
 def export_profile(path, result, index):
     frame = result.frames[index]
     with open(path, "w", encoding="utf-8-sig", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow(("time_s", "depth_mm", "temperature_C", "local_remaining_mass_pct"))
-        mass = (frame.residual[0], *frame.residual, frame.residual[-1])
-        for depth, temp, remaining in zip(result.depth_mm, frame.temperature, mass, strict=True):
-            writer.writerow(f"{v:.8g}" for v in (frame.time, depth, temp, remaining))
+        writer.writerow(("time_s", "depth_mm", "temperature_C", "local_remaining_mass_pct",
+                         *(("location",) if result.interfaces else ())))
+        for depth, temp, remaining, location in profile_points(result, frame):
+            values = [f"{v:.8g}" for v in (frame.time, depth, temp, remaining)]
+            writer.writerow(values + ([location] if result.interfaces else []))
 
 
 @dataclass(frozen=True)
@@ -3566,6 +3913,7 @@ class SlabCase:
     time_index: int = 0
     section: SectionParameters | None = None
     selected_gas: str | None = None
+    selected_interface: int | None = None
 
 
 def save_slab_case(path, case):
@@ -3590,18 +3938,24 @@ def save_slab_case(path, case):
                 if row[key] is None:
                     del row[key]
         if case.kinetics.gas_species or case.kinetics.slab_porosity != 30 or case.kinetics.slab_vent != "front":
-            version = CASE_VERSION
+            version = 4
         else:
             for key in ("gas_species", "slab_porosity", "slab_vent"):
                 del network[key]
             for row in network["reactions"]:
                 del row["gas_yields"]
+        if case.kinetics.layers:
+            version = CASE_VERSION
+        else:
+            del network["layers"]
         reactions = {"type": "network", "data": network}
     elif isinstance(case.kinetics, SlabMechanism):
         reactions = {"type": "multistep", "data": asdict(case.kinetics)}
     else:
         reactions = {"type": "single", "data": case.kinetics}
     if case.view == "gas_balance":
+        version = max(version, 4)
+    if case.view == "interfaces":
         version = CASE_VERSION
     payload = {
         "format": CASE_FORMAT, "version": version, "parameters": asdict(case.parameters),
@@ -3609,11 +3963,21 @@ def save_slab_case(path, case):
         "result": asdict(case.result) if case.result else None,
         "view": {"probe_depth_mm": case.probe_depth, "plot": case.view, "time_index": case.time_index},
     }
+    if case.selected_interface is not None:
+        if (case.view != "interfaces" or not isinstance(case.kinetics, ReactionNetwork)
+                or type(case.selected_interface) is not int or not 0 <= case.selected_interface < len(case.kinetics.layers) - 1):
+            raise ValueError("视图所选界面与材料分层不一致。")
+        payload["view"]["interface"] = case.selected_interface
     if case.selected_gas is not None:
         if (case.view != "gas_balance" or not isinstance(case.kinetics, ReactionNetwork)
                 or case.selected_gas not in case.kinetics.gas_names):
             raise ValueError("视图所选气体须在气体组分表中。")
         payload["view"]["gas_species"] = case.selected_gas
+    if case.result:
+        del payload["result"]["interfaces"]  # derived from the layer table and grid count
+        if not case.result.interfaces:
+            for row in payload["result"]["frames"]:
+                del row["interface_values"]
     if case.result and not case.result.gas_names:
         del payload["result"]["gas_names"]
         for row in payload["result"]["frames"]:
@@ -3656,12 +4020,13 @@ def case_vector(data, size):
     return tuple(checked_case_number(value) for value in data)
 
 
-def decode_case_result(data, parameters, multistep, component_names=(), gas_names=(), initial_pore=()):
+def decode_case_result(data, parameters, multistep, component_names=(), gas_names=(), initial_pore=(), mesh=None):
     if not isinstance(data, dict):
         raise ValueError("算例结果格式有误。")
     count = int(parameters.cells)
     depths = case_vector(data.get("depth_mm"), count + 2)
-    expected = (0.0, *(parameters.thickness * (i + .5) / count for i in range(count)), parameters.thickness)
+    expected = mesh.depths if mesh else (0.0, *(parameters.thickness * (i + .5) / count for i in range(count)), parameters.thickness)
+    interfaces = mesh.interfaces if mesh else ()
     if any(not math.isclose(a, b, rel_tol=1e-8, abs_tol=1e-8) for a, b in zip(depths, expected)):
         raise ValueError("算例结果的深度网格与设置不一致。")
     stored_names = data.get("component_names", [])
@@ -3688,8 +4053,9 @@ def decode_case_result(data, parameters, multistep, component_names=(), gas_name
         composition = case_vector(row.get("composition"), ncomp)
         if not math.isclose(temp[0], numbers["front"], abs_tol=1e-7) or not math.isclose(temp[-1], numbers["back"], abs_tol=1e-7):
             raise ValueError("算例的表面温度与温度剖面不一致。")
+        mean_solid = sum(w * r for w, r in zip(mesh.weights, residual)) / count if mesh else sum(residual) / count
         if (any(not -1e-7 <= value <= 100 + 1e-7 for value in (*residual, *composition))
-                or not math.isclose(sum(residual) / count, numbers["remaining_mass"], abs_tol=1e-7)
+                or not math.isclose(mean_solid, numbers["remaining_mass"], abs_tol=1e-7)
                 or numbers["loss_rate"] < 0):
             raise ValueError("算例的局部剩余质量或质量损失率无效。")
         if composition and (abs(sum(composition) - 100) > 1e-6
@@ -3709,14 +4075,21 @@ def decode_case_result(data, parameters, multistep, component_names=(), gas_name
         if balances and not math.isclose(math.fsum(b.produced - b.consumed for b in balances),
                                          composition[-1], rel_tol=1e-8, abs_tol=1e-6):
             raise ValueError("各气体的净生成量与凝聚相挥发量不一致。")
+        samples = row.get("interface_values", [])
+        if not isinstance(samples, list) or len(samples) != len(interfaces):
+            raise ValueError("界面结果数量与材料层不匹配。")
+        samples = tuple(case_vector(sample, 3) for sample in samples)
+        for face, (a, b, q) in zip(interfaces, samples):
+            if not math.isclose(a - b, q * face.resistance, rel_tol=1e-8, abs_tol=1e-7):
+                raise ValueError("算例的界面温差、热流和接触热阻不一致。")
         frames.append(SlabFrame(**numbers, temperature=temp, residual=residual, composition=composition,
-                                gas_balance=balances))
+                                gas_balance=balances, interface_values=samples))
     if frames[0].time != 0 or not math.isclose(previous, parameters.duration, abs_tol=1e-7):
         raise ValueError("算例结果的起止时刻与模拟时长不一致。")
     summary = [checked_case_number(data.get(key)) for key in ("peak_loss", "mass_error", "energy_error")]
     if any(value < 0 for value in summary) or summary[0] + 1e-8 < max(frame.loss_rate for frame in frames):
         raise ValueError("算例结果的汇总数据无效。")
-    return SlabResult(expected, tuple(frames), *summary, component_names, gas_names)
+    return SlabResult(expected, tuple(frames), *summary, component_names, gas_names, interfaces)
 
 
 def load_slab_case(path):
@@ -3729,7 +4102,7 @@ def load_slab_case(path):
     except (UnicodeError, ValueError, RecursionError) as error:
         raise ValueError("无法读取算例 JSON。") from error
     if (not isinstance(data, dict) or data.get("format") != CASE_FORMAT
-            or type(data.get("version")) is not int or data.get("version") not in (1, 2, 3, CASE_VERSION)):
+            or type(data.get("version")) is not int or data.get("version") not in (1, 2, 3, 4, CASE_VERSION)):
         raise ValueError("算例格式或版本不受支持。")
     parameters = SlabParameters(**checked_case_fields(data.get("parameters"), (v[0] for v in SLAB_FIELDS)))
     validate_slab(parameters)
@@ -3739,6 +4112,7 @@ def load_slab_case(path):
     multi = reactions["type"] == "multistep"
     source = reactions.get("data")
     component_names, gas_names, initial_pore = (), (), ()
+    mesh = None
     if reactions["type"] == "network":
         if not isinstance(source, dict):
             raise ValueError("算例缺少组分与反应表。")
@@ -3758,11 +4132,11 @@ def load_slab_case(path):
                 for k, v in row.items():
                     if k in strings:
                         continue
-                    if k == "gas_yields":
+                    if k in ("gas_yields", "fractions"):
                         if not isinstance(v, list):
-                            raise ValueError("气体产率行须为数值数组。")
+                            raise ValueError("气体产率或分层质量分数须为数值数组。")
                         numeric[k] = tuple(checked_case_number(y) for y in v)
-                    elif v is None and k in ("diffusivity", "heat", "solid_heat", "gas_heat"):
+                    elif v is None and k in ("diffusivity", "heat", "solid_heat", "gas_heat", "initial_temperature"):
                         continue
                     else:
                         numeric[k] = checked_case_number(v)
@@ -3777,11 +4151,14 @@ def load_slab_case(path):
                                    records("materials", SpeciesThermal, ("name",)) if "materials" in source else (),
                                    checked_case_number(source.get("reference_temperature", 298.15)),
                                    records("gas_species", GasSpecies, ("name",)) if "gas_species" in source else (),
-                                   checked_case_number(source.get("slab_porosity", 30)), source.get("slab_vent", "front"))
+                                   checked_case_number(source.get("slab_porosity", 30)), source.get("slab_vent", "front"),
+                                   records("layers", MaterialLayer, ("name",)) if "layers" in source else ())
         kinetics.validate()
         component_names, gas_names = kinetics.names, kinetics.gas_names
-        if gas_names:
-            density = (SolidMixture(kinetics, parameters.ambient + KELVIN).initial_density
+        if kinetics.layers and data.get("result") is not None:
+            mesh = LayerMesh(kinetics, parameters, int(parameters.cells))
+        if gas_names and data.get("result") is not None:
+            density = mesh.density if mesh else (SolidMixture(kinetics, parameters.ambient + KELVIN).initial_density
                        if kinetics.materials else parameters.density)
             initial_pore = tuple(g.initial_concentration * kinetics.slab_porosity / density for g in kinetics.gas_species)
     elif multi:
@@ -3807,7 +4184,7 @@ def load_slab_case(path):
     depth = checked_case_number(view.get("probe_depth_mm"))
     if not 0 <= depth <= parameters.thickness:
         raise ValueError("算例测点不在平板范围内。")
-    result = (decode_case_result(data["result"], parameters, multi, component_names, gas_names, initial_pore)
+    result = (decode_case_result(data["result"], parameters, multi, component_names, gas_names, initial_pore, mesh)
               if data.get("result") is not None else None)
     index = view.get("time_index")
     if type(index) is not int or not 0 <= index < (len(result.frames) if result else 1):
@@ -3825,7 +4202,12 @@ def load_slab_case(path):
     selected_gas = view.get("gas_species")
     if selected_gas is not None and (view["plot"] != "gas_balance" or selected_gas not in gas_names):
         raise ValueError("视图所选气体与气体组分表不一致。")
-    return SlabCase(parameters, kinetics, result, depth, view["plot"], index, section, selected_gas)
+    selected_interface = view.get("interface")
+    if selected_interface is not None and (view["plot"] != "interfaces" or not isinstance(kinetics, ReactionNetwork)
+                                           or type(selected_interface) is not int
+                                           or not 0 <= selected_interface < len(kinetics.layers) - 1):
+        raise ValueError("视图所选界面与材料分层不一致。")
+    return SlabCase(parameters, kinetics, result, depth, view["plot"], index, section, selected_gas, selected_interface)
 
 
 SECTION_QUANTITIES = {
@@ -3840,7 +4222,7 @@ SECTION_HELP = """二维截面在惰性气氛中计算宽向 x 与厚向 z 的�
 
 完全转化厚度以初始厚度为 100%。例如 80% 表示缩至 0.8 倍，120% 表示膨胀至 1.2 倍。厚度随原材料平均转化率线性变化，宽度固定，各列同步伸缩。孔隙率则随各单元原材料转化率在两个输入端点间插值。几何伸缩和孔隙率是独立指定的经验关系。模型假设孔隙中的气体以扩散传质，忽略压力驱动流动、气体携热及变形功。
 
-色标在一次计算的所有时刻固定。纵轴按该次计算的最大厚度绘制，横纵轴分别标度。悬停可读取单元中心值。质量汇总以初始干样质量为基准。下拉菜单可选择每种气体的孔内浓度，单位 kg/m³ 孔隙。时间历程 CSV 包含厚度、固体、各气体的生成、消耗、库存与两面净排出，截面 CSV 含物理坐标、温度、局部固体与气体浓度。
+色标在一次计算的所有时刻固定。纵轴按该次计算的最大厚度绘制，横纵轴分别标度。悬停可读取单元中心值。质量汇总以初始干样质量为基准。下拉菜单可选择每种气体的孔内浓度，单位 kg/m³ 孔隙。时间历程 CSV 包含厚度、固体、各气体的生成、消耗、库存与两面净排出，截面 CSV 含物理坐标、温度、局部固体与气体浓度。分层试样沿厚向使用与界面对齐的网格。虚线标出各层交界，悬停读数和截面 CSV 包含所在层名。
 
 在一维平板窗口保存算例可同时保存本窗口的参数。打开算例后运行二维计算即可重建各时刻的截面。示例参数用于检查模型行为，实际材料需用实验标定孔隙率、扩散系数和厚度演化。"""
 
@@ -4045,11 +4427,16 @@ class SectionWindow:
         bottom = top + (h - 100) * f.thickness / self.max_depth
         dx, dz = (right - left) / nx, (bottom - top) / nz
         self.plot_box = (left, right, top, bottom, dx, dz)
+        edges = self.result.depth_edges or tuple(z/nz for z in range(nz+1))
+        y_edges = [top + e * (bottom - top) for e in edges]
         for i, val in enumerate(values):
             z, x = divmod(i, nx)
             fraction = (val - lo) / (hi - lo) if hi > lo else 0.0
-            c.create_rectangle(left + dx * x, top + dz * z, left + dx * (x + 1), top + dz * (z + 1),
+            c.create_rectangle(left + dx * x, y_edges[z], left + dx * (x + 1), y_edges[z+1],
                                fill=self.color(fraction), outline="")
+        for z in range(1, len(self.result.layer_names)):
+            if self.result.layer_names[z-1] != self.result.layer_names[z]:
+                c.create_line(left, y_edges[z], right, y_edges[z], fill=INK, dash=(4, 3))
         c.create_rectangle(left, top, right, bottom, outline=MUTED)
         strip = (right - left) * s.heated / 100
         mid = (left + right) / 2
@@ -4083,13 +4470,17 @@ class SectionWindow:
             self.readout.set("移动鼠标可读取单元中心值")
             return
         f, s = self.result.frames[self.index()], self.result.settings
-        x, z = int((event.x - left) / dx), int((event.y - top) / dz)
         nx, nz = int(s.nx), int(s.nz)
+        edges = self.result.depth_edges or tuple(z/nz for z in range(nz+1))
+        x = min(nx-1, int((event.x - left) / dx))
+        z = min(nz-1, bisect.bisect_right(edges, (event.y - top)/(bottom - top)) - 1)
+        depth = (edges[z] + edges[z+1]) * f.thickness / 2
+        layer = self.result.layer_names[z] + " · " if self.result.layer_names else ""
         i = z * nx + x
         j = self.quantity.current() - len(SECTION_QUANTITIES)
         name = self.result.gas_names[j] if j >= 0 else "孔内气体"
         concentration = f.gas_concentrations[j][i] if j >= 0 else f.concentration[i]
-        self.readout.set(f"x {(x + .5) * s.width / nx:.2f}, z {(z + .5) * f.thickness / nz:.2f} mm"
+        self.readout.set(f"{layer}x {(x + .5) * s.width / nx:.2f}, z {depth:.2f} mm"
                          f"  ·  {f.temperature[i]:.1f} °C  ·  固体 {f.residual[i]:.2f}%  ·  {name} {concentration:.3g} kg/m³")
 
     def export(self, spatial):
@@ -4283,7 +4674,8 @@ class SlabWindow:
             thermal = f"组分热物性 · Tr {self.mechanism.reference_temperature:g} K" if material_mode else "共用平板热物性"
             self.kinetics_label.set(f"自定义模型 · {len(self.mechanism.components)} 种组分"
                                     f" · {len(self.mechanism.reactions)} 条反应 · {thermal}"
-                                    + (f" · {len(self.mechanism.gas_species)} 种气体" if self.mechanism.gas_species else ""))
+                                    + (f" · {len(self.mechanism.gas_species)} 种气体" if self.mechanism.gas_species else "")
+                                    + (f" · {len(self.mechanism.layers)} 层" if self.mechanism.layers else ""))
             return
         if self.mechanism is not None:
             mode = "两步并联" if self.mechanism.mode == "parallel" else "两步串联"
@@ -4508,8 +4900,13 @@ class SlabWindow:
         selected = self.component_choice.get()
         if self.mode.get() != "gas_balance" or not isinstance(kinetics, ReactionNetwork) or selected not in kinetics.gas_names:
             selected = None
+        interface = None
+        if self.mode.get() == "interfaces" and result is not None:
+            j = self.component_choice.current()
+            if 0 <= j < len(result.interfaces):
+                interface = j
         case = SlabCase(parameters, kinetics, result, min(self.probe_depth, parameters.thickness),
-                        self.mode.get(), self.frame_index() if result else 0, self.section_settings, selected)
+                        self.mode.get(), self.frame_index() if result else 0, self.section_settings, selected, interface)
         path = self.lab.dialog.asksaveasfilename(parent=self.window, defaultextension=".json",
             initialfile=self.case_name or "slab_case.json", filetypes=[("平板算例", "*.json")])
         if path:
@@ -4551,6 +4948,10 @@ class SlabWindow:
         self.probe_input.set(f"{case.probe_depth:.8g}")
         self.mode.set(case.view)
         self.component_choice.set(case.selected_gas or "")
+        if case.selected_interface is not None:
+            j = case.selected_interface
+            layers = case.kinetics.layers
+            self.component_choice.set(f"{j+1} · {layers[j].name} → {layers[j+1].name}")
         self.case_name = Path(path).name
         self.case_label.set(self.case_name)
         self.dirty = case.result is None
@@ -4581,6 +4982,8 @@ class SlabWindow:
                 names = (*self.result.component_names, "gases")
             elif mode == "gas_balance":
                 names = self.result.gas_names
+            elif mode == "interfaces":
+                names = tuple(f"{i} · {f.front_layer} → {f.back_layer}" for i, f in enumerate(self.result.interfaces, 1))
         if names:
             self.component_choice.configure(values=names)
             if self.component_choice.get() not in names:
@@ -4601,11 +5004,10 @@ class SlabWindow:
         if profile:
             selected = frames[self.frame_index()]
             self.frame_label.set(f"剖面 {selected.time:.2f} s · 测点 {self.probe_depth:g} mm · 点击图中位置可移动测点")
-            xs = self.result.depth_mm
+            xs, temp, mass, _ = zip(*profile_points(self.result, selected))
             if mode == "profile":
-                yname, traces = "温度 (°C)", [("温度", AIR, selected.temperature)]
+                yname, traces = "温度 (°C)", [("温度", AIR, temp)]
             else:
-                mass = (selected.residual[0], *selected.residual, selected.residual[-1])
                 yname, traces = "局部剩余质量 (%)", [("剩余质量", NITROGEN, mass)]
             xname = "样品深度 (mm)"
         else:
@@ -4620,6 +5022,16 @@ class SlabWindow:
             elif mode == "mass":
                 yname = "剩余质量 (%)"
                 traces = [("剩余质量", NITROGEN, tuple(f.remaining_mass for f in frames))]
+            elif mode == "interfaces":
+                if not names:
+                    canvas.create_text(w/2, h/2, text="在「材料分层」中添加两层或以上后运行。", fill=MUTED)
+                    return
+                j = self.component_choice.current()
+                a, b, q = frames[-1].interface_values[j]
+                self.frame_label.set(f"终点 · 界面 {self.result.interfaces[j].depth:g} mm · 受热侧 {a:.2f} °C"
+                                     f" · 背侧 {b:.2f} °C · 热流 {q:.3g} W/m²（向背面为正）")
+                yname = "热流密度 (W/m²)"
+                traces = [("层间热流", AIR, tuple(f.interface_values[j][2] for f in frames))]
             elif mode == "gas_balance":
                 if not names:
                     canvas.create_text(w / 2, h / 2, text="在「组分与反应表」填写气体组分和产率矩阵后重新运行。", fill=MUTED)
@@ -4674,6 +5086,8 @@ class SlabWindow:
             canvas.create_text(left - 6, yy(y), text=f"{y:.4g}", fill=MUTED, anchor="e")
         canvas.create_text((left + right) / 2, h - 10, text=xname, fill=MUTED)
         if profile:
+            for face in self.result.interfaces:
+                canvas.create_line(xx(face.depth), top, xx(face.depth), bottom, fill=MUTED, dash=(2, 3))
             x = xx(self.probe_depth)
             canvas.create_line(x, top, x, bottom, fill=ACCENT, dash=(3, 4))
         for i, (name, color, trace) in enumerate(traces):
